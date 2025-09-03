@@ -1,5 +1,9 @@
 # models.py
 
+import numpy as np
+import ntlk
+import spacy
+
 from sentiment_data import *
 from utils import *
 
@@ -30,8 +34,47 @@ class UnigramFeatureExtractor(FeatureExtractor):
     Extracts unigram bag-of-words features from a sentence. It's up to you to decide how you want to handle counts
     and any additional preprocessing you want to do.
     """
-    def __init__(self, indexer: Indexer):
-        raise Exception("Must be implemented")
+    def __init__(self, indexer: Indexer, lowercase=True, binary=True, stopwords=None, add_bias=True):
+        self.indexer = indexer
+        self.lowercase = lowercase
+        self.binary = binary
+        self.stopwords = set(stopwords or [])
+        self.add_bias = add_bias
+        self.bias_name = "BIAS"
+
+    def _norm(self, w):
+        return w.lower() if self.lowercase else w
+    
+    def extract(self, tokens, add_to_indexer=True):
+        """
+        tokens: list[str]
+        add_to_indexer=True when building vocab (training), False for dev/test.
+        returns: dict[int, float]  (sparse vector: feature_index -> value)
+        """
+        # normalize + drop stopwords
+        toks = [self._norm(t) for t in tokens if self._norm(t) not in self.stopwords]
+
+        feats = {}
+        if self.binary:
+            for w in set(toks):
+                name = f"Unigram={w}"
+                idx = self.indexer.add_and_get_index(name, add=add_to_indexer)
+                if idx != -1:  # -1 means unseen and add=False
+                    feats[idx] = 1.0
+        else:
+            counts = Counter(toks)
+            for w, c in counts.items():
+                name = f"Unigram={w}"
+                idx = self.indexer.add_and_get_index(name, add=add_to_indexer)
+                if idx != -1:
+                    feats[idx] = float(c)
+
+        if self.add_bias:
+            bidx = self.indexer.add_and_get_index(self.bias_name, add=add_to_indexer)
+            if bidx != -1:
+                feats[bidx] = 1.0
+
+        return feats
 
 
 class BigramFeatureExtractor(FeatureExtractor):
