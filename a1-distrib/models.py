@@ -77,7 +77,7 @@ class UnigramFeatureExtractor(FeatureExtractor):
                 feats[bidx] = 1.0
 
         return feats
-        
+
     def extract_features(self, sentence: List[str], add_to_indexer: bool=False) -> Counter:
         # delegate to your extract()
         return self.extract(sentence, add_to_indexer=add_to_indexer)
@@ -161,7 +161,7 @@ def train_perceptron(train_exs: List[SentimentExample], feat_extractor: FeatureE
     # Fixed-size numpy weight vector
     w = np.zeros(len(feat_extractor.indexer), dtype=float)
 
-    epochs = 5          # tweak if needed
+    epochs = 50          # tweak if needed
     lr = 1.0            # perceptron is scale-invariant; 1.0 is standard
 
     for _ in range(epochs):
