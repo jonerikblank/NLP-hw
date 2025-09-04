@@ -1,8 +1,10 @@
 # models.py
 
 import numpy as np
-import ntlk
+import nltk
 import spacy
+import random
+from typing import List
 
 from sentiment_data import *
 from utils import *
@@ -34,7 +36,7 @@ class UnigramFeatureExtractor(FeatureExtractor):
     Extracts unigram bag-of-words features from a sentence. It's up to you to decide how you want to handle counts
     and any additional preprocessing you want to do.
     """
-    def __init__(self, indexer: Indexer, lowercase=True, binary=True, stopwords=None, add_bias=True):
+    def __init__(self, indexer: Indexer, lowercase=True, binary=False, stopwords=None, add_bias=True):
         self.indexer = indexer
         self.lowercase = lowercase
         self.binary = binary
@@ -54,7 +56,7 @@ class UnigramFeatureExtractor(FeatureExtractor):
         # normalize + drop stopwords
         toks = [self._norm(t) for t in tokens if self._norm(t) not in self.stopwords]
 
-        feats = {}
+        feats = Counter()
         if self.binary:
             for w in set(toks):
                 name = f"Unigram={w}"
@@ -75,6 +77,10 @@ class UnigramFeatureExtractor(FeatureExtractor):
                 feats[bidx] = 1.0
 
         return feats
+        
+    def extract_features(self, sentence: List[str], add_to_indexer: bool=False) -> Counter:
+        # delegate to your extract()
+        return self.extract(sentence, add_to_indexer=add_to_indexer)
 
 
 class BigramFeatureExtractor(FeatureExtractor):
@@ -119,8 +125,16 @@ class PerceptronClassifier(SentimentClassifier):
     superclass. Hint: you'll probably need this class to wrap both the weight vector and featurizer -- feel free to
     modify the constructor to pass these in.
     """
-    def __init__(self):
-        raise Exception("Must be implemented")
+    def __init__(self, feat_extractor: FeatureExtractor, w: np.ndarray):
+        self.feat_extractor = feat_extractor
+        self.w = w
+
+    def _score(self, feats: Counter) -> float:
+      return sum(self.w[i]*v for i,v in feats.items())
+
+    def predict (self, sentence: List[str]) -> int:
+      x = self.feat_extractor.extract_features(sentence, add_to_indexer=False)
+      return 1 if self._score(x) >= 0 else 0
 
 
 class LogisticRegressionClassifier(SentimentClassifier):
@@ -140,7 +154,38 @@ def train_perceptron(train_exs: List[SentimentExample], feat_extractor: FeatureE
     :param feat_extractor: feature extractor to use
     :return: trained PerceptronClassifier model
     """
-    raise Exception("Must be implemented")
+    for ex in train_exs:
+        # ex.words is usually the token list; adjust if your SentimentExample differs
+        _ = feat_extractor.extract_features(ex.words, add_to_indexer=True)
+    
+    # Fixed-size numpy weight vector
+    w = np.zeros(len(feat_extractor.indexer), dtype=float)
+
+    epochs = 5          # tweak if needed
+    lr = 1.0            # perceptron is scale-invariant; 1.0 is standard
+
+    for _ in range(epochs):
+        random.shuffle(train_exs)  # shuffle each epoch
+
+        for ex in train_exs:
+            # Freeze vocab during actual training
+            x = feat_extractor.extract_features(ex.words, add_to_indexer=False)
+
+            # Map gold label {0,1} -> {-1,+1}
+            y = 1 if ex.label == 1 else -1
+
+            # Score (sparse dot)
+            s = sum(w[i] * v for i, v in x.items())
+
+            # Mistake-driven update
+            if y * s <= 0:
+                for i, v in x.items():
+                    w[i] += lr * y * v
+
+    # -------------------------
+    # 3) Return classifier
+    # -------------------------
+    return PerceptronClassifier(feat_extractor, w)
 
 
 def train_logistic_regression(train_exs: List[SentimentExample], feat_extractor: FeatureExtractor) -> LogisticRegressionClassifier:
