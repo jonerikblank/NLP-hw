@@ -228,12 +228,13 @@ def train_logistic_regression(train_exs: List[SentimentExample], feat_extractor:
     # Fixed-size numpy weight vector
     w = np.zeros(len(feat_extractor.indexer), dtype=float)
 
-    epochs = 50          # tweak if needed
-    lr = 1.0            # perceptron is scale-invariant; 1.0 is standard
+    epochs = 60          
+    base_lr = 1.2
+    l2 = 1e-6
 
     for epoch in range(epochs):
         random.shuffle(train_exs)  # shuffle each epoch
-
+        lr = base_lr / (1.0 + 0.2 * epoch) 
         for ex in train_exs:
             # Freeze vocab during actual training
             x = feat_extractor.extract_features(ex.words, add_to_indexer=False)
