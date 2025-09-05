@@ -88,8 +88,62 @@ class BigramFeatureExtractor(FeatureExtractor):
     """
     Bigram feature extractor analogous to the unigram one.
     """
-    def __init__(self, indexer: Indexer):
-        raise Exception("Must be implemented")
+    def __init__(self, indexer: Indexer, lowercase=True, binary=False, stopwords=None, add_bias=True, use_bounds=True):
+        self.indexer = indexer
+        self.lowercase = lowercase
+        self.binary = binary
+        self.stopwords = set(stopwords or [])
+        self.add_bias = add_bias
+        self.use_bounds = use_bounds   # if True, add BOS/EOS to capture sentence edges
+        self.bias_name = "BIAS"
+
+    def _norm(self, w):
+        return w.lower() if self.lowercase else w
+
+    def _bigrams(self, toks):
+        # Adjacent pairs only, with optional boundary markers
+        if self.use_bounds:
+            toks = ["<BOS>"] + toks + ["<EOS>"]
+        return [(toks[i], toks[i+1]) for i in range(len(toks)-1)]
+
+    def extract(self, tokens, add_to_indexer=True):
+        # normalize + drop stopwords
+        toks = [self._norm(t) for t in tokens if self._norm(t) not in self.stopwords]
+
+        feats = Counter()
+        if len(toks) == 0:
+            if self.add_bias:
+                bidx = self.indexer.add_and_get_index(self.bias_name, add=add_to_indexer)
+                if bidx != -1:
+                    feats[bidx] = 1.0
+            return feats
+
+        bigs = self._bigrams(toks)
+
+        if self.binary:
+            for a, b in set(bigs):
+                name = f"Bigram={a}__{b}"
+                idx = self.indexer.add_and_get_index(name, add=add_to_indexer)
+                if idx != -1:
+                    feats[idx] = 1.0
+        else:
+            counts = Counter(bigs)
+            for (a, b), c in counts.items():
+                name = f"Bigram={a}__{b}"
+                idx = self.indexer.add_and_get_index(name, add=add_to_indexer)
+                if idx != -1:
+                    feats[idx] = float(c)
+
+        if self.add_bias:
+            bidx = self.indexer.add_and_get_index(self.bias_name, add=add_to_indexer)
+            if bidx != -1:
+                feats[bidx] = 1.0
+
+        return feats
+
+    def extract_features(self, sentence: List[str], add_to_indexer: bool=False) -> Counter:
+        return self.extract(sentence, add_to_indexer=add_to_indexer)
+
 
 
 class BetterFeatureExtractor(FeatureExtractor):
