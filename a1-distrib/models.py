@@ -4,6 +4,7 @@ import numpy as np
 import nltk
 import spacy
 import random
+import math
 from typing import List
 
 from sentiment_data import *
@@ -143,8 +144,23 @@ class LogisticRegressionClassifier(SentimentClassifier):
     superclass. Hint: you'll probably need this class to wrap both the weight vector and featurizer -- feel free to
     modify the constructor to pass these in.
     """
-    def __init__(self):
-        raise Exception("Must be implemented")
+    def __init__(self, feat_extractor: FeatureExtractor, w: np.ndarray):
+        self.feat_extractor = feat_extractor
+        self.w = w
+
+    def _score(self, feats: Counter) -> float:
+        z = sum(self.w[i] * v for i, v in feats.items())
+        # sigmoid to squash into [0,1]
+        if z >= 0:
+            ez = math.exp (-z)
+            return 1.0 / (1.0 + ez)
+        else:
+          ez = math.exp (z)
+          return ez/(1.0+ez)
+
+    def predict (self, sentence: List[str]) -> int:
+      x = self.feat_extractor.extract_features(sentence, add_to_indexer=False)
+      return 1 if self._score(x) >= 0.5 else 0
 
 
 def train_perceptron(train_exs: List[SentimentExample], feat_extractor: FeatureExtractor) -> PerceptronClassifier:
@@ -154,10 +170,11 @@ def train_perceptron(train_exs: List[SentimentExample], feat_extractor: FeatureE
     :param feat_extractor: feature extractor to use
     :return: trained PerceptronClassifier model
     """
+            
     for ex in train_exs:
-        # ex.words is usually the token list; adjust if your SentimentExample differs
-        _ = feat_extractor.extract_features(ex.words, add_to_indexer=True)
-    
+            # ex.words is usually the token list; adjust if your SentimentExample differs
+            _ = feat_extractor.extract_features(ex.words, add_to_indexer=True)
+        
     # Fixed-size numpy weight vector
     w = np.zeros(len(feat_extractor.indexer), dtype=float)
 
@@ -195,7 +212,47 @@ def train_logistic_regression(train_exs: List[SentimentExample], feat_extractor:
     :param feat_extractor: feature extractor to use
     :return: trained LogisticRegressionClassifier model
     """
-    raise Exception("Must be implemented")
+
+    def _sigmoid(z: float) -> float:
+    # numerically stable sigmoid
+        if z >= 0:
+            ez = math.exp(-z)
+            return 1.0 / (1.0 + ez)
+        else:
+            ez = math.exp(z)
+            return ez / (1.0 + ez)
+    for ex in train_exs:
+        # ex.words is usually the token list; adjust if your SentimentExample differs
+        _ = feat_extractor.extract_features(ex.words, add_to_indexer=True)
+    
+    # Fixed-size numpy weight vector
+    w = np.zeros(len(feat_extractor.indexer), dtype=float)
+
+    epochs = 50          # tweak if needed
+    lr = 1.0            # perceptron is scale-invariant; 1.0 is standard
+
+    for epoch in range(epochs):
+        random.shuffle(train_exs)  # shuffle each epoch
+
+        for ex in train_exs:
+            # Freeze vocab during actual training
+            x = feat_extractor.extract_features(ex.words, add_to_indexer=False)
+
+            # Map gold label {0,1} -> {-1,+1}
+            y = 1 if ex.label == 1 else 0
+
+            z = sum(w[i] * v for i,v in x.items())
+            p = _sigmoid(z)
+
+            g = (y-p)
+
+            for i,v in x.items():
+              w[i] += lr * g * v
+
+    # -------------------------
+    # 3) Return classifier
+    # -------------------------
+    return LogisticRegressionClassifier(feat_extractor, w)
 
 
 def train_model(args, train_exs: List[SentimentExample], dev_exs: List[SentimentExample]) -> SentimentClassifier:
