@@ -44,16 +44,62 @@ class TrivialSentimentClassifier(SentimentClassifier):
         """
         return 1
 
+class DANNet(nn.Module):
+    """
+    Deep Averaging Network: takes word indices, looks up embeddings,
+    averages them, then applies an MLP for classification.
+    """
+    def __init__(self, embedding_layer: nn.Embedding, hidden_size: int, out_size: int = 2, dropout_p: float = 0.0):
+        super().__init__()
+        self.embedding = embedding_layer
+        embed_dim = embedding_layer.embedding_dim
 
-class NeuralSentimentClassifier(SentimentClassifier):
-    """
-    Implement your NeuralSentimentClassifier here. This should wrap an instance of the network with learned weights
-    along with everything needed to run it on new data (word embeddings, etc.). You will need to implement the predict
-    method and you can optionally override predict_all if you want to use batching at inference time (not necessary,
-    but may make things faster!)
-    """
-    def __init__(self):
-        raise NotImplementedError
+        self.fc1 = nn.Linear(embed_dim, hidden_size)
+        self.act = nn.ReLU()
+        self.drop = nn.Dropout(p=dropout_p) if dropout_p > 0 else nn.Identity()
+        self.fc2 = nn.Linear(hidden_size, out_size)
+
+    def forward(self, indices: torch.Tensor) -> torch.Tensor:
+        """
+        indices: tensor of shape [n_tokens] (or [batch, n_tokens] if you add batching later)
+        returns: logits [2] (or [batch, 2])
+        """
+        E = self.embedding(indices)   # [n_tokens, d]
+        avg = E.mean(dim=0)           # [d]
+        h = self.fc1(avg)
+        h = self.act(h)
+        h = self.drop(h)
+        return self.fc2(h)            # [2]
+
+cclass NeuralSentimentClassifier(SentimentClassifier):
+    def __init__(self, word_embeddings: WordEmbeddings, frozen_embeddings=True,
+                 hidden_size=200, dropout_p=0.0, device=torch.device("cpu")):
+        self.word_embeddings = word_embeddings
+        self.indexer = word_embeddings.word_indexer
+        self.device = device
+
+        embedding_layer = get_initialized_embedding_layer(word_embeddings, frozen=frozen_embeddings)
+        self.net = DANNet(embedding_layer, hidden_size, out_size=2, dropout_p=dropout_p).to(self.device)
+
+        self.UNK_IDX = 1
+
+    def _words_to_indices(self, words: List[str]) -> torch.Tensor:
+        ids = [self.indexer.index_of(w) or self.UNK_IDX for w in words]
+        if not ids:
+            ids = [self.UNK_IDX]
+        return torch.tensor(ids, dtype=torch.long, device=self.device)
+
+    def logits_from_words(self, words: List[str]) -> torch.Tensor:
+        indices = self._words_to_indices(words)
+        return self.net(indices)
+
+    def predict(self, ex_words: List[str], has_typos: bool) -> int:
+        self.net.eval()
+        with torch.no_grad():
+            logits = self.logits_from_words(ex_words)
+            return int(torch.argmax(logits).item())
+
+
 
 
 def train_deep_averaging_network(args, train_exs: List[SentimentExample], dev_exs: List[SentimentExample],
@@ -68,5 +114,67 @@ def train_deep_averaging_network(args, train_exs: List[SentimentExample], dev_ex
     and return an instance of that for the typo setting if you want; you're allowed to return two different model types
     for the two settings.
     """
-    raise NotImplementedError
+    lr = args.lr
+    num_epochs = args.num_epochs
+    hidden_size = args.hidden_size
 
+    frozen_embeddings = not train_model_for_typo_setting
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    clf = NeuralSentimentClassifier(
+        word_embeddings=word_embeddings,
+        frozen_embeddings=frozen_embeddings,
+        hidden_size=hidden_size,
+        dropout_p=0.0,   # add a --dropout arg later if you want
+        device=device
+    )
+
+    clf.net = DANNet(
+        embedding_layer=embedding_layer,
+        hidden_size=hidden_size,
+        out_size=2,
+        dropout_p=0.0
+    ).to(device)
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(clf.net.parameters(), lr=lr)
+
+    best_dev_acc = -1.0
+    best_state = None
+
+    for epoch in range(1, num_epochs + 1):
+        clf.net.train()
+        random.shuffle(train_exs)
+        total_loss = 0.0
+
+        for ex in train_exs:
+            # words -> indices -> logits
+            logits = clf.logits_from_words(ex.words)  # <--- clean API
+            gold = torch.tensor(ex.label, dtype=torch.long, device=device)
+
+            loss = criterion(logits, gold)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+
+        # Dev eval
+        clf.net.eval()
+        correct = 0
+        with torch.no_grad():
+            for ex in dev_exs:
+                pred = clf.predict(ex.words, has_typos=False)
+                correct += int(pred == ex.label)
+        dev_acc = correct / max(1, len(dev_exs))
+
+        print(f"Epoch {epoch:02d} | train_loss={total_loss/len(train_exs):.4f} | dev_acc={dev_acc:.4f}")
+
+        if dev_acc > best_dev_acc:
+            best_dev_acc = dev_acc
+            best_state = {k: v.detach().cpu() for k, v in clf.net.state_dict().items()}
+
+    if best_state is not None:
+        clf.net.load_state_dict(best_state)
+
+    return clf
