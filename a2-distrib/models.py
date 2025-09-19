@@ -71,17 +71,22 @@ class DANNet(nn.Module):
         h = self.drop(h)
         return self.fc2(h)            # [2]
 
-cclass NeuralSentimentClassifier(SentimentClassifier):
+class NeuralSentimentClassifier(SentimentClassifier):
     def __init__(self, word_embeddings: WordEmbeddings, frozen_embeddings=True,
                  hidden_size=200, dropout_p=0.0, device=torch.device("cpu")):
         self.word_embeddings = word_embeddings
         self.indexer = word_embeddings.word_indexer
         self.device = device
 
-        embedding_layer = get_initialized_embedding_layer(word_embeddings, frozen=frozen_embeddings)
+        embedding_layer = word_embeddings.get_initialized_embedding_layer(
+          frozen=frozen_embeddings,
+          padding_idx=0   # PAD is index 0 per the assignment; this keeps PAD as the zero vector
+          )
+
         self.net = DANNet(embedding_layer, hidden_size, out_size=2, dropout_p=dropout_p).to(self.device)
 
-        self.UNK_IDX = 1
+        self.UNK_IDX = self.indexer.index_of("UNK")
+
 
     def _words_to_indices(self, words: List[str]) -> torch.Tensor:
         ids = [self.indexer.index_of(w) or self.UNK_IDX for w in words]
@@ -129,13 +134,6 @@ def train_deep_averaging_network(args, train_exs: List[SentimentExample], dev_ex
         dropout_p=0.0,   # add a --dropout arg later if you want
         device=device
     )
-
-    clf.net = DANNet(
-        embedding_layer=embedding_layer,
-        hidden_size=hidden_size,
-        out_size=2,
-        dropout_p=0.0
-    ).to(device)
 
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(clf.net.parameters(), lr=lr)
