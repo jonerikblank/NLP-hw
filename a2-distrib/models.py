@@ -234,51 +234,42 @@ class NeuralSentimentClassifier(SentimentClassifier):
         device = self.device
 
         with torch.no_grad():
-            # Iterate over the dataset in chunks
+            
             for start in range(0, len(all_ex_words), batch_size):
                 chunk = all_ex_words[start:start + batch_size]
 
-                # --- build [B, T] padded index matrix ---
+               
                 id_lists = []
                 for words in chunk:
                     ids = [self._word_to_idx(w) for w in words]
-                    if not ids:  # safety
+                    if not ids: 
                         ids = [self.UNK_IDX]
                     id_lists.append(ids)
 
-                T = max(len(x) for x in id_lists)  # dynamic pad to longest in this batch
+                T = max(len(x) for x in id_lists)  
                 B = len(id_lists)
-                padded = torch.zeros(B, T, dtype=torch.long, device=device)  # PAD=0
+                padded = torch.zeros(B, T, dtype=torch.long, device=device)  
 
                 for i, ids in enumerate(id_lists):
                     L = len(ids)
                     padded[i, :L] = torch.tensor(ids, dtype=torch.long, device=device)
 
-                # --- forward & argmax ---
-                logits = self.net(padded)                 # [B, 2]
-                batch_preds = torch.argmax(logits, dim=1) # [B]
+                logits = self.net(padded)               
+                batch_preds = torch.argmax(logits, dim=1) 
                 preds.extend(batch_preds.tolist())
 
         return preds
+
 def collate_fn_train(ex_list: List[SentimentExample],
-                     indexer,
-                     unk_idx: int,
+                     token_to_idx,               
                      pad_idx: int = 0,
                      max_len: int = None,
                      device: torch.device = torch.device("cpu")):
-    """
-    Turn a list of SentimentExample into:
-      - indices: LongTensor [B, T] (padded with PAD=0)
-      - labels:  LongTensor [B]
-    If max_len is provided, sequences are truncated to that length.
-    """
     seqs, labels = [], []
     for ex in ex_list:
-        ids = [indexer.index_of(w) for w in ex.words]
-        # Map OOV (-1 or None) -> UNK
-        ids = [unk_idx if (i is None or i < 0) else i for i in ids]
+        ids = [token_to_idx(w) for w in ex.words]  
         if not ids:
-            ids = [unk_idx]
+            ids = [token_to_idx("UNK")]             
         seqs.append(ids)
         labels.append(ex.label)
 
@@ -293,6 +284,7 @@ def collate_fn_train(ex_list: List[SentimentExample],
 
     labels = torch.tensor(labels, dtype=torch.long, device=device)
     return indices, labels
+
 
 
 
@@ -320,8 +312,6 @@ def train_deep_averaging_network(args, train_exs: List[SentimentExample], dev_ex
       use_prefix = False
       frozen_embeddings = True
 
-    frozen_embeddings = not train_model_for_typo_setting
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     clf = NeuralSentimentClassifier(
@@ -335,10 +325,12 @@ def train_deep_averaging_network(args, train_exs: List[SentimentExample], dev_ex
     )
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(clf.net.parameters(), lr=lr)
+    optimizer = optim.Adam(clf.net.parameters(), lr=lr, weight_decay=1e-4)
 
     best_dev_acc = -1.0
     best_state = None
+    patience = 3
+    no_improve = 0
 
     for epoch in range(1, num_epochs + 1):
         clf.net.train()
@@ -350,8 +342,7 @@ def train_deep_averaging_network(args, train_exs: List[SentimentExample], dev_ex
             batch = train_exs[start:start + batch_size]
             batch_indices, batch_labels = collate_fn_train(
                 batch,
-                indexer=clf.indexer,
-                unk_idx=clf.UNK_IDX,
+                token_to_idx = clf._word_to_idx,
                 pad_idx=0,
                 max_len=None,        # or set a cap like 40 if you want truncation
                 device=device
@@ -378,6 +369,12 @@ def train_deep_averaging_network(args, train_exs: List[SentimentExample], dev_ex
         if dev_acc > best_dev_acc:
             best_dev_acc = dev_acc
             best_state = {k: v.detach().cpu() for k, v in clf.net.state_dict().items()}
+            no_improve = 0
+        else:
+            no_improve += 1
+            if no_improve >= patience:
+                print(f"Early stopping at epoch {epoch} (no improvement for {patience} epochs)")
+                break
 
     if best_state is not None:
         clf.net.load_state_dict(best_state)
