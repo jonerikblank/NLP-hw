@@ -7,6 +7,7 @@ import numpy as np
 from collections import Counter
 import torch.nn
 
+
 class SentimentExample:
     """
     Data wrapper for a single example for sentiment analysis.

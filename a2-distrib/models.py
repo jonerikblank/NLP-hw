@@ -8,6 +8,89 @@ import random
 from sentiment_data import *
 
 
+# ---- Prefix Embeddings (k-mer) ----
+class PrefixEmbeddings:
+    """
+    Embeddings over first-k-character prefixes.
+    - indexer: Indexer mapping prefix -> id (PAD=0, UNK_PREFIX=1)
+    - vectors: np.ndarray [num_prefixes, d]
+    """
+    def __init__(self, prefix_indexer, vectors: np.ndarray, k: int = 3):
+        self.prefix_indexer = prefix_indexer
+        self.vectors = vectors
+        self.k = k
+
+    def get_initialized_embedding_layer(self, frozen: bool = False, padding_idx: int = 0):
+        return nn.Embedding.from_pretrained(
+            torch.FloatTensor(self.vectors),
+            freeze=frozen,
+            padding_idx=padding_idx
+        )
+
+    def get_embedding_length(self):
+        return self.vectors.shape[1]
+
+    def prefix_of(self, word: str) -> str:
+        if len(word) >= self.k:
+            return word[:self.k]
+        # Very short tokens can just use themselves; you could also route them to UNK
+        return word
+
+    def index_of_prefix(self, prefix: str) -> int:
+        idx = self.prefix_indexer.index_of(prefix)
+        return idx if idx is not None and idx >= 0 else self.prefix_indexer.index_of("UNK_PREFIX")
+
+
+def build_prefix_embeddings(word_embeddings: WordEmbeddings, k: int = 3) -> PrefixEmbeddings:
+    """
+    Build PrefixEmbeddings by averaging word vectors for each k-prefix present in the vocab.
+    - PAD=0 (zeros), UNK_PREFIX=1 (zeros)
+    - Other prefixes initialized as mean of all words starting with that prefix
+    """
+    # 1) Collect all words in the word vocab (skip PAD/UNK)
+    word_indexer = word_embeddings.word_indexer
+    V = len(word_indexer)
+
+    # Determine embedding dim
+    d = word_embeddings.get_embedding_length()
+
+    # 2) Build prefix indexer with PAD and UNK_PREFIX
+    prefix_indexer = Indexer()
+    prefix_indexer.add_and_get_index("PAD")         # 0
+    prefix_indexer.add_and_get_index("UNK_PREFIX")  # 1
+
+    # 3) First pass: collect sums & counts per prefix
+    # Use dict prefix -> (sum_vec, count)
+    sums = {}
+    counts = {}
+
+    for wid in range(V):
+        w = word_indexer.get_object(wid)
+        if w in ("PAD", "UNK") or w is None:
+            continue
+        pref = w[:k] if len(w) >= k else w
+        if pref not in sums:
+            sums[pref] = np.zeros(d, dtype=np.float32)
+            counts[pref] = 0
+        sums[pref] += word_embeddings.vectors[wid]   # numpy vector
+        counts[pref] += 1
+
+    # 4) Build vectors array: [num_prefixes, d]
+    # Start with PAD and UNK rows as zeros
+    vectors = []
+    vectors.append(np.zeros(d, dtype=np.float32))  # PAD
+    vectors.append(np.zeros(d, dtype=np.float32))  # UNK_PREFIX
+
+    # Add prefixes in a stable order
+    for pref in sorted(sums.keys()):
+        prefix_indexer.add_and_get_index(pref)
+        avg = sums[pref] / max(1, counts[pref])
+        vectors.append(avg.astype(np.float32))
+
+    vectors = np.stack(vectors, axis=0)  # shape [num_prefixes, d]
+    return PrefixEmbeddings(prefix_indexer, vectors, k=k)
+
+
 class SentimentClassifier(object):
     """
     Sentiment classifier base type
@@ -61,36 +144,66 @@ class DANNet(nn.Module):
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
         """
-        indices: tensor of shape [n_tokens] (or [batch, n_tokens] if you add batching later)
-        returns: logits [2] (or [batch, 2])
+        indices: [B, T] or [T]
+        returns: logits [B, 2] (or [1, 2] if input was [T])
         """
-        E = self.embedding(indices)   # [n_tokens, d]
-        avg = E.mean(dim=0)           # [d]
+        if indices.dim() == 1:
+            indices = indices.unsqueeze(0)  # [1, T]
+
+        E = self.embedding(indices)                 # [B, T, d]
+        mask = (indices != 0).unsqueeze(-1).float() # [B, T, 1] (PAD=0)
+        sum_vec = (E * mask).sum(dim=1)             # [B, d]
+        lengths = mask.sum(dim=1).clamp(min=1.0)    # [B, 1]
+        avg = sum_vec / lengths                     # [B, d]
+
         h = self.fc1(avg)
         h = self.act(h)
         h = self.drop(h)
-        return self.fc2(h)            # [2]
+        logits = self.fc2(h)                        # [B, 2]
+        return logits
 
 class NeuralSentimentClassifier(SentimentClassifier):
     def __init__(self, word_embeddings: WordEmbeddings, frozen_embeddings=True,
-                 hidden_size=200, dropout_p=0.0, device=torch.device("cpu")):
-        self.word_embeddings = word_embeddings
+                 hidden_size=200, dropout_p=0.0, device=torch.device("cpu"),
+                 use_prefix_embeddings: bool = False, prefix_k: int = 3):
         self.indexer = word_embeddings.word_indexer
         self.device = device
+        self.use_prefix = use_prefix_embeddings
+        self.prefix_k = prefix_k
 
-        embedding_layer = word_embeddings.get_initialized_embedding_layer(
-          frozen=frozen_embeddings,
-          padding_idx=0   # PAD is index 0 per the assignment; this keeps PAD as the zero vector
-          )
-
-        self.net = DANNet(embedding_layer, hidden_size, out_size=2, dropout_p=dropout_p).to(self.device)
-
-        self.UNK_IDX = self.indexer.index_of("UNK")
-
+        if self.use_prefix:
+            # ---- Build prefix embeddings from word embeddings (not frozen) ----
+            self.prefix_embs = build_prefix_embeddings(word_embeddings, k=self.prefix_k)
+            self.indexer = self.prefix_embs.prefix_indexer
+            self.embedding = self.prefix_embs.get_initialized_embedding_layer(
+                frozen=False,                      # IMPORTANT: allow finetuning
+                padding_idx=self.indexer.index_of("PAD")
+            )
+            self.UNK_IDX = self.indexer.index_of("UNK_PREFIX")
+        else:
+            # ---- Original word embeddings path ----
+            self.indexer = word_embeddings.word_indexer
+            self.embedding = word_embeddings.get_initialized_embedding_layer(
+                frozen=frozen_embeddings,
+                padding_idx=self.indexer.index_of("PAD")
+            )
+            self.UNK_IDX = self.indexer.index_of("UNK")
+        embed_dim = self.embedding.embedding_dim
+        self.net = DANNet(self.embedding, hidden_size, out_size=2, dropout_p=dropout_p).to(self.device)
+        self.embedding.to(self.device)
+    
+    def _word_to_idx(self, w: str) -> int:
+        if self.use_prefix:
+            pref = w[:self.prefix_k] if len(w) >= self.prefix_k else w
+            idx = self.indexer.index_of(pref)
+            return self.UNK_IDX if (idx is None or idx < 0) else idx
+        else:
+            idx = self.indexer.index_of(w)
+            return self.UNK_IDX if (idx is None or idx < 0) else idx
 
     def _words_to_indices(self, words: List[str]) -> torch.Tensor:
-        ids = [self.indexer.index_of(w) or self.UNK_IDX for w in words]
-        if not ids:
+        ids = [self._word_to_idx(w) for w in words]
+        if not ids:  # safety
             ids = [self.UNK_IDX]
         return torch.tensor(ids, dtype=torch.long, device=self.device)
 
@@ -103,6 +216,83 @@ class NeuralSentimentClassifier(SentimentClassifier):
         with torch.no_grad():
             logits = self.logits_from_words(ex_words)
             return int(torch.argmax(logits).item())
+
+    def predict_all(self, all_ex_words: List[List[str]], has_typos: bool, batch_size: int = 64) -> List[int]:
+        """
+        Batched prediction for speed. 
+        - Converts words -> indices
+        - Pads to the longest sequence in the batch with PAD=0
+        - Runs the network once per batch and argmaxes logits
+        
+        Assumes:
+        - self._word_to_idx maps OOV -> UNK (index 1)
+        - PAD index is 0 (embedding was built with padding_idx=0)
+        - DANNet.forward(masking) averages only non-PAD tokens
+        """
+        self.net.eval()
+        preds: List[int] = []
+        device = self.device
+
+        with torch.no_grad():
+            # Iterate over the dataset in chunks
+            for start in range(0, len(all_ex_words), batch_size):
+                chunk = all_ex_words[start:start + batch_size]
+
+                # --- build [B, T] padded index matrix ---
+                id_lists = []
+                for words in chunk:
+                    ids = [self._word_to_idx(w) for w in words]
+                    if not ids:  # safety
+                        ids = [self.UNK_IDX]
+                    id_lists.append(ids)
+
+                T = max(len(x) for x in id_lists)  # dynamic pad to longest in this batch
+                B = len(id_lists)
+                padded = torch.zeros(B, T, dtype=torch.long, device=device)  # PAD=0
+
+                for i, ids in enumerate(id_lists):
+                    L = len(ids)
+                    padded[i, :L] = torch.tensor(ids, dtype=torch.long, device=device)
+
+                # --- forward & argmax ---
+                logits = self.net(padded)                 # [B, 2]
+                batch_preds = torch.argmax(logits, dim=1) # [B]
+                preds.extend(batch_preds.tolist())
+
+        return preds
+def collate_fn_train(ex_list: List[SentimentExample],
+                     indexer,
+                     unk_idx: int,
+                     pad_idx: int = 0,
+                     max_len: int = None,
+                     device: torch.device = torch.device("cpu")):
+    """
+    Turn a list of SentimentExample into:
+      - indices: LongTensor [B, T] (padded with PAD=0)
+      - labels:  LongTensor [B]
+    If max_len is provided, sequences are truncated to that length.
+    """
+    seqs, labels = [], []
+    for ex in ex_list:
+        ids = [indexer.index_of(w) for w in ex.words]
+        # Map OOV (-1 or None) -> UNK
+        ids = [unk_idx if (i is None or i < 0) else i for i in ids]
+        if not ids:
+            ids = [unk_idx]
+        seqs.append(ids)
+        labels.append(ex.label)
+
+    T = (max_len if max_len is not None else max(len(s) for s in seqs))
+    B = len(seqs)
+    indices = torch.full((B, T), fill_value=pad_idx, dtype=torch.long, device=device)
+    for i, ids in enumerate(seqs):
+        if max_len is not None:
+            ids = ids[:max_len]
+        L = min(len(ids), T)
+        indices[i, :L] = torch.tensor(ids[:L], dtype=torch.long, device=device)
+
+    labels = torch.tensor(labels, dtype=torch.long, device=device)
+    return indices, labels
 
 
 
@@ -122,6 +312,13 @@ def train_deep_averaging_network(args, train_exs: List[SentimentExample], dev_ex
     lr = args.lr
     num_epochs = args.num_epochs
     hidden_size = args.hidden_size
+    batch_size = args.batch_size
+    if train_model_for_typo_setting:
+      use_prefix = True
+      frozen_embeddings = False
+    else:
+      use_prefix = False
+      frozen_embeddings = True
 
     frozen_embeddings = not train_model_for_typo_setting
 
@@ -131,8 +328,10 @@ def train_deep_averaging_network(args, train_exs: List[SentimentExample], dev_ex
         word_embeddings=word_embeddings,
         frozen_embeddings=frozen_embeddings,
         hidden_size=hidden_size,
-        dropout_p=0.0,   # add a --dropout arg later if you want
-        device=device
+        dropout_p=0.3,   
+        device=device,
+        use_prefix_embeddings=use_prefix,
+        prefix_k=3
     )
 
     criterion = nn.CrossEntropyLoss()
@@ -146,24 +345,32 @@ def train_deep_averaging_network(args, train_exs: List[SentimentExample], dev_ex
         random.shuffle(train_exs)
         total_loss = 0.0
 
-        for ex in train_exs:
-            # words -> indices -> logits
-            logits = clf.logits_from_words(ex.words)  # <--- clean API
-            gold = torch.tensor(ex.label, dtype=torch.long, device=device)
+        # ---- iterate in mini-batches ----
+        for start in range(0, len(train_exs), batch_size):
+            batch = train_exs[start:start + batch_size]
+            batch_indices, batch_labels = collate_fn_train(
+                batch,
+                indexer=clf.indexer,
+                unk_idx=clf.UNK_IDX,
+                pad_idx=0,
+                max_len=None,        # or set a cap like 40 if you want truncation
+                device=device
+            )
 
-            loss = criterion(logits, gold)
+            logits = clf.net(batch_indices)     # [B, 2]
+            loss = criterion(logits, batch_labels)
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
 
-        # Dev eval
+        # ---- dev eval (you can keep simple or use batched predict_all) ----
         clf.net.eval()
-        correct = 0
         with torch.no_grad():
-            for ex in dev_exs:
-                pred = clf.predict(ex.words, has_typos=False)
-                correct += int(pred == ex.label)
+            # Faster: use your batched predict_all
+            preds = clf.predict_all([ex.words for ex in dev_exs], has_typos=False, batch_size=256)
+            correct = sum(int(p == ex.label) for p, ex in zip(preds, dev_exs))
         dev_acc = correct / max(1, len(dev_exs))
 
         print(f"Epoch {epoch:02d} | train_loss={total_loss/len(train_exs):.4f} | dev_acc={dev_acc:.4f}")
