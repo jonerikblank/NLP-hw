@@ -6,6 +6,7 @@ from torch import optim
 import numpy as np
 import random
 from sentiment_data import *
+import copy
 
 
 # ---- Prefix Embeddings (k-mer) ----
@@ -20,12 +21,13 @@ class PrefixEmbeddings:
         self.vectors = vectors
         self.k = k
 
-    def get_initialized_embedding_layer(self, frozen: bool = False, padding_idx: int = 0):
-        return nn.Embedding.from_pretrained(
-            torch.FloatTensor(self.vectors),
-            freeze=frozen,
-            padding_idx=padding_idx
-        )
+    def get_initialized_embedding_layer(self, frozen: bool = False, padding_idx: int = 0, sparse: bool = True):
+        num_prefixes, d = self.vectors.shape
+        emb = nn.Embedding(num_prefixes, d, padding_idx=padding_idx, sparse=sparse)
+        emb.weight.data.copy_(torch.from_numpy(self.vectors))
+        emb.weight.requires_grad = not frozen
+        return emb
+
 
     def get_embedding_length(self):
         return self.vectors.shape[1]
@@ -128,14 +130,12 @@ class TrivialSentimentClassifier(SentimentClassifier):
         return 1
 
 class DANNet(nn.Module):
-    """
-    Deep Averaging Network: takes word indices, looks up embeddings,
-    averages them, then applies an MLP for classification.
-    """
-    def __init__(self, embedding_layer: nn.Embedding, hidden_size: int, out_size: int = 2, dropout_p: float = 0.0):
+    def __init__(self, embedding_layer: nn.Embedding, hidden_size: int, out_size: int = 2, dropout_p: float = 0.2):
         super().__init__()
         self.embedding = embedding_layer
         embed_dim = embedding_layer.embedding_dim
+
+        self.ln = nn.LayerNorm(embed_dim)          # <- NEW
 
         self.fc1 = nn.Linear(embed_dim, hidden_size)
         self.act = nn.ReLU()
@@ -143,24 +143,21 @@ class DANNet(nn.Module):
         self.fc2 = nn.Linear(hidden_size, out_size)
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
-        """
-        indices: [B, T] or [T]
-        returns: logits [B, 2] (or [1, 2] if input was [T])
-        """
         if indices.dim() == 1:
-            indices = indices.unsqueeze(0)  # [1, T]
-
+            indices = indices.unsqueeze(0)
         E = self.embedding(indices)                 # [B, T, d]
-        mask = (indices != 0).unsqueeze(-1).float() # [B, T, 1] (PAD=0)
-        sum_vec = (E * mask).sum(dim=1)             # [B, d]
-        lengths = mask.sum(dim=1).clamp(min=1.0)    # [B, 1]
+        mask = (indices != 0).unsqueeze(-1).float()
+        sum_vec = (E * mask).sum(dim=1)
+        lengths = mask.sum(dim=1).clamp(min=1.0)
         avg = sum_vec / lengths                     # [B, d]
+        avg = self.ln(avg)                          # <- NEW
 
         h = self.fc1(avg)
         h = self.act(h)
         h = self.drop(h)
-        logits = self.fc2(h)                        # [B, 2]
+        logits = self.fc2(h)
         return logits
+
 
 class NeuralSentimentClassifier(SentimentClassifier):
     def __init__(self, word_embeddings: WordEmbeddings, frozen_embeddings=True,
@@ -170,14 +167,15 @@ class NeuralSentimentClassifier(SentimentClassifier):
         self.device = device
         self.use_prefix = use_prefix_embeddings
         self.prefix_k = prefix_k
-
+    
         if self.use_prefix:
             # ---- Build prefix embeddings from word embeddings (not frozen) ----
             self.prefix_embs = build_prefix_embeddings(word_embeddings, k=self.prefix_k)
             self.indexer = self.prefix_embs.prefix_indexer
             self.embedding = self.prefix_embs.get_initialized_embedding_layer(
-                frozen=False,                      # IMPORTANT: allow finetuning
-                padding_idx=self.indexer.index_of("PAD")
+                frozen=False,
+                padding_idx=self.indexer.index_of("PAD"),
+                sparse=True                      # << important
             )
             self.UNK_IDX = self.indexer.index_of("UNK_PREFIX")
         else:
@@ -215,7 +213,8 @@ class NeuralSentimentClassifier(SentimentClassifier):
         self.net.eval()
         with torch.no_grad():
             logits = self.logits_from_words(ex_words)
-            return int(torch.argmax(logits).item())
+            return int(torch.argmax(logits, dim=-1).item())
+
 
     def predict_all(self, all_ex_words: List[List[str]], has_typos: bool, batch_size: int = 64) -> List[int]:
         """
@@ -254,9 +253,10 @@ class NeuralSentimentClassifier(SentimentClassifier):
                     L = len(ids)
                     padded[i, :L] = torch.tensor(ids, dtype=torch.long, device=device)
 
-                logits = self.net(padded)               
-                batch_preds = torch.argmax(logits, dim=1) 
+                logits = self.net(padded)
+                batch_preds = torch.argmax(logits, dim=1)
                 preds.extend(batch_preds.tolist())
+
 
         return preds
 
@@ -291,84 +291,104 @@ def collate_fn_train(ex_list: List[SentimentExample],
 
 def train_deep_averaging_network(args, train_exs: List[SentimentExample], dev_exs: List[SentimentExample],
                                  word_embeddings: WordEmbeddings, train_model_for_typo_setting: bool) -> NeuralSentimentClassifier:
-    """
-    :param args: Command-line args so you can access them here
-    :param train_exs: training examples
-    :param dev_exs: development set, in case you wish to evaluate your model during training
-    :param word_embeddings: set of loaded word embeddings
-    :param train_model_for_typo_setting: True if we should train the model for the typo setting, False otherwise
-    :return: A trained NeuralSentimentClassifier model. Note: you can create an additional subclass of SentimentClassifier
-    and return an instance of that for the typo setting if you want; you're allowed to return two different model types
-    for the two settings.
-    """
     lr = args.lr
     num_epochs = args.num_epochs
     hidden_size = args.hidden_size
-    batch_size = args.batch_size
+    batch_size = max(args.batch_size, 64)
+    # at the top of train_deep_averaging_network (once)
+    torch.manual_seed(1337)
+    np.random.seed(1337)
+    random.seed(1337)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(1337)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
     if train_model_for_typo_setting:
-      use_prefix = True
-      frozen_embeddings = False
+        use_prefix = True
+        frozen_embeddings = False          # trainable prefix embeddings
     else:
-      use_prefix = False
-      frozen_embeddings = False
+        use_prefix = False
+        frozen_embeddings = True           # freeze for non-typo path (faster)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     clf = NeuralSentimentClassifier(
         word_embeddings=word_embeddings,
         frozen_embeddings=frozen_embeddings,
-        hidden_size=hidden_size,
-        dropout_p=0.2,   
+        hidden_size=256,
+        dropout_p=0.2,
         device=device,
         use_prefix_embeddings=use_prefix,
         prefix_k=3
     )
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(clf.net.parameters(), lr=lr, weight_decay=1e-4)
 
-    best_dev_acc = -1.0
-    best_state = None
-    patience = 3
-    no_improve = 0
+    # --- OPTIMIZERS: define ONCE ---
+    if train_model_for_typo_setting:
+        # SparseAdam only for the sparse embedding; Adam for the dense MLP
+        emb_param = [clf.net.embedding.weight]
+        other_params = [p for n, p in clf.net.named_parameters() if n != "embedding.weight"]
+        opt_emb   = optim.SparseAdam(emb_param, lr=.003)                   # no weight_decay
+        opt_other = optim.Adam(other_params, lr=.001, weight_decay=0.0)
+    else:
+        optimizer = optim.Adam(clf.net.parameters(), lr=.001, weight_decay=0.0)
+
+    best_dev_acc, best_state = -1.0, None
+    patience, no_improve = 4, 0
 
     for epoch in range(1, num_epochs + 1):
         clf.net.train()
         random.shuffle(train_exs)
         total_loss = 0.0
 
-        # ---- iterate in mini-batches ----
         for start in range(0, len(train_exs), batch_size):
             batch = train_exs[start:start + batch_size]
             batch_indices, batch_labels = collate_fn_train(
                 batch,
-                token_to_idx = clf._word_to_idx,
+                token_to_idx=clf._word_to_idx,
                 pad_idx=0,
-                max_len=None,        # or set a cap like 40 if you want truncation
+                max_len=60,     # keep as-is for Step 1; cap later for more speed
                 device=device
             )
 
-            logits = clf.net(batch_indices)     # [B, 2]
+            logits = clf.net(batch_indices)
             loss = criterion(logits, batch_labels)
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
+            if train_model_for_typo_setting:
+                opt_other.zero_grad(set_to_none=True)
+                opt_emb.zero_grad(set_to_none=True)
+                loss.backward()
+                # clip only dense params; sparse grads cannot be clipped
+                torch.nn.utils.clip_grad_norm_(other_params, 5.0)
+                opt_other.step()
+                opt_emb.step()
+            else:
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(clf.net.parameters(), 5.0)
+                optimizer.step()
 
-        # ---- dev eval (you can keep simple or use batched predict_all) ----
+            # inside the batch loop
+            total_loss += loss.item() * batch_indices.size(0)
+
+       # --- Dev eval (same path the harness uses) ---
         clf.net.eval()
         with torch.no_grad():
-            # Faster: use your batched predict_all
             preds = clf.predict_all([ex.words for ex in dev_exs], has_typos=False, batch_size=256)
             correct = sum(int(p == ex.label) for p, ex in zip(preds, dev_exs))
         dev_acc = correct / max(1, len(dev_exs))
+        avg_loss = total_loss / len(train_exs)
+        print(f"Epoch {epoch:02d} | train_loss={avg_loss:.4f} | dev_acc={dev_acc:.4f}")
 
-        print(f"Epoch {epoch:02d} | train_loss={total_loss/len(train_exs):.4f} | dev_acc={dev_acc:.4f}")
+
+
 
         if dev_acc > best_dev_acc:
             best_dev_acc = dev_acc
-            best_state = {k: v.detach().cpu() for k, v in clf.net.state_dict().items()}
+            best_state = copy.deepcopy(clf.net.state_dict())   # <- deep copy the whole thing
             no_improve = 0
         else:
             no_improve += 1
@@ -378,5 +398,11 @@ def train_deep_averaging_network(args, train_exs: List[SentimentExample], dev_ex
 
     if best_state is not None:
         clf.net.load_state_dict(best_state)
+    clf.net.eval()
+    with torch.no_grad():
+        preds = clf.predict_all([ex.words for ex in dev_exs], has_typos=False, batch_size=256)
+        correct = sum(int(p == ex.label) for p, ex in zip(preds, dev_exs))
+    restored_dev_acc = correct / max(1, len(dev_exs))
+    print(f"best dev_acc seen: {best_dev_acc:.4f} | restored dev_acc: {restored_dev_acc:.4f}")
 
     return clf
