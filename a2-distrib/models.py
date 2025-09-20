@@ -310,7 +310,7 @@ def train_deep_averaging_network(args, train_exs: List[SentimentExample], dev_ex
       frozen_embeddings = False
     else:
       use_prefix = False
-      frozen_embeddings = True
+      frozen_embeddings = False
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -318,7 +318,7 @@ def train_deep_averaging_network(args, train_exs: List[SentimentExample], dev_ex
         word_embeddings=word_embeddings,
         frozen_embeddings=frozen_embeddings,
         hidden_size=hidden_size,
-        dropout_p=0.3,   
+        dropout_p=0.2,   
         device=device,
         use_prefix_embeddings=use_prefix,
         prefix_k=3
