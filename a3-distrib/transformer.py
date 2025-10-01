@@ -1,5 +1,6 @@
 # transformer.py
 
+import os
 import time
 import torch
 import torch.nn as nn
@@ -29,7 +30,7 @@ class LetterCountingExample(object):
 # a single layer of the Transformer; this Module will take the raw words as input and do all of the steps necessary
 # to return distributions over the labels (0, 1, or 2).
 class Transformer(nn.Module):
-    def __init__(self, vocab_size, num_positions, d_model, d_internal, num_classes, num_layers):
+    def __init__(self, vocab_size, num_positions, d_model, d_internal, num_classes, num_layers, use_positional=True, causal = False, dropout = 0.1):
         """
         :param vocab_size: vocabulary size of the embedding layer
         :param num_positions: max sequence length that will be fed to the model; should be 20
@@ -39,7 +40,29 @@ class Transformer(nn.Module):
         :param num_layers: number of TransformerLayers to use; can be whatever you want
         """
         super().__init__()
-        raise Exception("Implement me")
+        self.vocab_size = vocab_size
+        self.num_positions = num_positions
+        self.d_model = d_model
+        self.num_classes = num_classes
+        self.use_positional = use_positional
+        self.causal = causal
+
+        self.char_emb = nn.Embedding(vocab_size, d_model)
+        self.pos_enc = PositionalEncoding(d_model, num_positions, batched=False)
+
+        self.layers = nn.ModuleList([
+            TransformerLayer(d_model, d_internal, dropout=dropout)
+            for _ in range(num_layers)
+        ])
+
+        self.classifier = nn.Linear(d_model, num_classes)
+        self.log_softmax = nn.LogSoftmax(dim=-1)
+
+    def _causal_mask(self, L: int):
+        # Mask out future positions: upper triangle (k=1) gets a large negative
+        mask = torch.triu(torch.ones(L, L), diagonal=1)
+        mask = mask.masked_fill(mask == 1, float("-inf"))
+        return mask
 
     def forward(self, indices):
         """
@@ -48,13 +71,30 @@ class Transformer(nn.Module):
         :return: A tuple of the softmax log probabilities (should be a 20x3 matrix) and a list of the attention
         maps you use in your layers (can be variable length, but each should be a 20x20 matrix)
         """
-        raise Exception("Implement me")
+        x = self.char_emb(indices)  # [L, d_model]
+
+        # Positional encodings if enabled
+        if self.use_positional:
+            x = self.pos_enc(x)
+
+        L = x.size(0)
+        attn_mask = self._causal_mask(L) if self.causal else None
+
+        attn_maps = []
+        h = x
+        for layer in self.layers:
+            h, attn = layer(h, attn_mask=attn_mask)
+            attn_maps.append(attn)
+
+        logits = self.classifier(h)               # [L, num_classes]
+        log_probs = self.log_softmax(logits)      # [L, num_classes]
+        return log_probs, attn_maps
 
 
 # Your implementation of the Transformer layer goes here. It should take vectors and return the same number of vectors
 # of the same length, applying self-attention, the feedforward layer, etc.
 class TransformerLayer(nn.Module):
-    def __init__(self, d_model, d_internal):
+    def __init__(self, d_model, d_internal, dropout=0.1):
         """
         :param d_model: The dimension of the inputs and outputs of the layer (note that the inputs and outputs
         have to be the same size for the residual connection to work)
@@ -62,10 +102,40 @@ class TransformerLayer(nn.Module):
         should both be of this length.
         """
         super().__init__()
-        raise Exception("Implement me")
+        # Self-attention projections
+        self.W_q = nn.Linear(d_model, d_internal, bias=False)
+        self.W_k = nn.Linear(d_model, d_internal, bias=False)
+        self.W_v = nn.Linear(d_model, d_model,    bias=False)
+        self.W_o = nn.Linear(d_model, d_model,    bias=False)
 
-    def forward(self, input_vecs):
-        raise Exception("Implement me")
+        # Position-wise FFN
+        self.ff1 = nn.Linear(d_model, 2 * d_model)
+        self.ff2 = nn.Linear(2 * d_model, d_model)
+        self.act = nn.ReLU()
+
+        self.dropout = nn.Dropout(dropout)
+        self.scale = np.sqrt(d_internal)
+
+    def forward(self, input_vecs, attn_mask = None):
+        Q = self.W_q(input_vecs)          # [L, d_k]
+        K = self.W_k(input_vecs)          # [L, d_k]
+        V = self.W_v(input_vecs)          # [L, d_model]
+
+        # Scores & masking
+        scores = (Q @ K.transpose(0, 1)) / self.scale  # [L, L]
+        if attn_mask is not None:
+            scores = scores + attn_mask
+
+        attn = torch.softmax(scores, dim=-1)          # [L, L]
+
+        # Weighted sum
+        context = attn @ V                             # [L, d_model]
+        out1 = input_vecs + self.dropout(self.W_o(context))  # residual 1
+
+        # FFN block
+        ff = self.ff2(self.act(self.ff1(out1)))
+        out2 = out1 + self.dropout(ff)                 # residual 2
+        return out2, attn
 
 
 # Implementation of positional encoding that you can use in your network
@@ -103,29 +173,72 @@ class PositionalEncoding(nn.Module):
 
 # This is a skeleton for train_classifier: you can implement this however you want
 def train_classifier(args, train, dev):
-    raise Exception("Not fully implemented yet")
+    os.makedirs("plots", exist_ok=True)
 
-    # The following code DOES NOT WORK but can be a starting point for your implementation
-    # Some suggested snippets to use:
-    model = Transformer(...)
-    model.zero_grad()
+    # Task wiring
+    is_before = (args.task == "BEFORE")
+    use_pos = is_before          # main task needs positional encodings
+    causal = is_before           # enforce look-back only on BEFORE
+
+    # Hyperparams
+    vocab_size = 27
+    num_positions = 20
+    d_model = 64
+    d_internal = 32
+    num_classes = 3
+    num_layers = 2 if is_before else 1
+    lr = 1e-3
+    weight_decay = 0.0
+    num_epochs = 10 if is_before else 6
+
+    # Model + optim
+    model = Transformer(vocab_size, num_positions, d_model, d_internal, num_classes,
+                        num_layers, use_positional=use_pos, causal=causal, dropout=0.1)
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    loss_fcn = nn.NLLLoss()
+
+    # Simple per-example training (fixed 20-length sequences)
     model.train()
-    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    best_dev_acc = -1.0
+    best_state = None
 
-    num_epochs = 10
-    for t in range(0, num_epochs):
+    def evaluate_acc(examples):
+        model.eval()
+        num_correct, num_total = 0, 0
+        with torch.no_grad():
+            for ex in examples:
+                logp, _ = model.forward(ex.input_tensor)
+                pred = torch.argmax(logp, dim=1)                # [20]
+                num_correct += (pred == ex.output_tensor).sum().item()
+                num_total += pred.numel()
+        model.train()
+        return num_correct / max(1, num_total)
+
+    for epoch in range(num_epochs):
         loss_this_epoch = 0.0
-        random.seed(t)
-        # You can use batching if you'd like
-        ex_idxs = [i for i in range(0, len(train))]
+        ex_idxs = list(range(len(train)))
         random.shuffle(ex_idxs)
-        loss_fcn = nn.NLLLoss()
-        for ex_idx in ex_idxs:
-            loss = loss_fcn(...) # TODO: Run forward and compute loss
-            # model.zero_grad()
-            # loss.backward()
-            # optimizer.step()
+        for idx in ex_idxs:
+            ex = train[idx]
+            logp, _ = model.forward(ex.input_tensor)            # [20, 3]
+            loss = loss_fcn(logp.view(-1, num_classes), ex.output_tensor.view(-1))
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
             loss_this_epoch += loss.item()
+
+        # Quick dev check
+        dev_acc = evaluate_acc(dev)
+        if dev_acc > best_dev_acc:
+            best_dev_acc = dev_acc
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+        print(f"Epoch {epoch+1:02d} | train_loss={loss_this_epoch/len(train):.4f} | dev_acc={dev_acc:.4f}")
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
     model.eval()
     return model
 
