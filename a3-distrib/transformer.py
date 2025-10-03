@@ -161,14 +161,13 @@ class PositionalEncoding(nn.Module):
         """
         # Second-to-last dimension will always be sequence length
         input_size = x.shape[-2]
-        indices_to_embed = torch.tensor(np.asarray(range(0, input_size))).type(torch.LongTensor)
+        # build indices directly on the same device as x
+        indices_to_embed = torch.arange(input_size, device=x.device, dtype=torch.long)
         if self.batched:
-            # Use unsqueeze to form a [1, seq len, embedding dim] tensor -- broadcasting will ensure that this
-            # gets added correctly across the batch
-            emb_unsq = self.emb(indices_to_embed).unsqueeze(0)
+            emb_unsq = self.emb(indices_to_embed).unsqueeze(0)  # [1, T, D]
             return x + emb_unsq
         else:
-            return x + self.emb(indices_to_embed)
+            return x + self.emb(indices_to_embed)               # [T, D]
 
 
 # This is a skeleton for train_classifier: you can implement this however you want

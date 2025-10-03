@@ -49,13 +49,6 @@ class UniformLanguageModel(LanguageModel):
 
     def get_log_prob_sequence(self, next_chars, context):
         return np.log(1.0/self.voc_size) * len(next_chars)
-def _generate_causal_mask(seq_len: int, device) -> torch.Tensor:
-    """
-    mask[i, j] = -inf if j > i else 0; shape [T, T]
-    """
-    mask = torch.full((seq_len, seq_len), float('-inf'), device=device)
-    return torch.triu(mask, diagonal=1)  # upper triangle is -inf; diag & lower are 0
-
 
 def _oov_to_space_idx(vocab_index, ch: str) -> int:
     """
@@ -97,11 +90,16 @@ class CharTransformerLM(nn.Module):
             dim_feedforward=dim_feedforward,
             dropout=dropout,
             batch_first=True,      # expect [B, T, D]
-            activation='gelu'
+            activation='gelu',
+            norm_first = True
         )
         self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
         self.norm = nn.LayerNorm(d_model)
-        self.proj = nn.Linear(d_model, vocab_size)
+        self.proj = nn.Linear(d_model, vocab_size, bias = False)
+        self.proj.weight = self.embed.weight
+        self.emb_norm = nn.LayerNorm(d_model)
+        self._mask_cache = {}  # cache by (T, device)
+        
 
     def forward(self, x_ids: torch.Tensor) -> torch.Tensor:
         """
@@ -109,12 +107,22 @@ class CharTransformerLM(nn.Module):
         returns logits: [B, T, V]
         """
         B, T = x_ids.shape
-        device = x_ids.device
-        src_mask = _generate_causal_mask(T, device)   # [T, T]
 
-        x = self.embed(x_ids) * math.sqrt(self.d_model)  # [B, T, D]
-        x = self.pos(x)                                   # learned positions
-        x = self.encoder(x, mask=src_mask)                # [B, T, D]
+        x = self.embed(x_ids) * math.sqrt(self.d_model)
+        x = self.emb_norm(x)
+        x = self.pos(x)
+
+        # cached boolean causal mask (upper triangle = True -> disallowed)
+        # cached float mask: 0 on allowed, -inf on future (upper triangle)
+        key = (T, x_ids.device)
+        if key not in self._mask_cache:
+            m = torch.full((T, T), float('-inf'), device=x_ids.device)
+            m = torch.triu(m, diagonal=1)  # upper triangle -inf; diag/lower 0
+            self._mask_cache[key] = m
+        mask = self._mask_cache[key]
+
+
+        x = self.encoder(x, mask=mask)   # no is_causal
         x = self.norm(x)
         logits = self.proj(x)                              # [B, T, V]
         return logits
@@ -148,36 +156,35 @@ class NeuralLanguageModel(LanguageModel):
     @torch.no_grad()
     def get_log_prob_sequence(self, next_chars, context):
         self.model.eval()
+        # encode once
         ctx_ids = self._encode(context)
         nxt_ids = self._encode(next_chars)
-        targets = ctx_ids + nxt_ids
 
-        inputs = [self.sos_id] + targets[:-1]
+        total = 0.0
+        prefix = ctx_ids[:]  # grow this as we consume next_chars
+        for yi in nxt_ids:
+            # build input: [SOS] + prefix  (truncate to keep within max_seq_len)
+            in_ids = [self.sos_id] + prefix
+            if len(in_ids) > self.max_seq_len:
+                in_ids = in_ids[-self.max_seq_len:]
 
-        # Truncate tail if too long; keep input/target aligned
-        if len(inputs) > self.max_seq_len:
-            inputs  = inputs[-self.max_seq_len:]
-            targets = targets[-self.max_seq_len:]
+            x = torch.tensor(in_ids, dtype=torch.long, device=self.device).unsqueeze(0)  # [1, T]
+            logits = self.model(x)                     # [1, T, V]
+            last = logits[0, -1, :]                    # [V]
+            log_probs = F.log_softmax(last, dim=-1)
+            total += float(log_probs[yi].item())
 
-        x = torch.tensor(inputs,  dtype=torch.long, device=self.device).unsqueeze(0)  # [1, T]
-        y = torch.tensor(targets, dtype=torch.long, device=self.device).unsqueeze(0)  # [1, T]
+            # teacher-forcing prefix grows with the gold next token
+            prefix.append(yi)
 
-        logits = self.model(x)                 # [1, T, V]
-        log_probs = F.log_softmax(logits, dim=-1)  # [1, T, V]
-
-        # Gather log p of the gold tokens
-        gold = y  # [1, T]
-        selected = log_probs.gather(-1, gold.unsqueeze(-1)).squeeze(-1)  # [1, T]
-
-        # Sum only over next_chars positions
-        ctx_len = len(ctx_ids)
-        return float(selected[0, ctx_len:].sum().item())
+        return total
 
 def _stream_to_batches_batchfirst(
     ids: List[int],
     seq_len: int,
     batch_size: int,
     sos_id: int,
+    stride: int,
     shuffle: bool = True
 ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
     """
@@ -191,7 +198,7 @@ def _stream_to_batches_batchfirst(
     if last_start < 0:
         return []  # not enough data; caller should guard/adjust seq_len
 
-    for start in range(0, last_start, seq_len):
+    for start in range(0, last_start, stride):
         y_chunk = ids[start:start + seq_len]
         if len(y_chunk) < seq_len:
             break
@@ -211,6 +218,34 @@ def _stream_to_batches_batchfirst(
         batches.append((xb, yb))
     return batches
 
+def _sample_random_batch(
+    ids: List[int],
+    seq_len: int,
+    batch_size: int,
+    sos_id: int,
+    device
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Randomly sample batch_size windows from the stream.
+    Returns xb, yb with shape [B, T] on device.
+    """
+    N = len(ids)
+    hi = max(1, N - seq_len)
+    starts = np.random.randint(0, hi, size=batch_size)
+
+    xs, ys = [], []
+    arr = ids
+    for s in starts:
+        y = arr[s:s+seq_len]
+        if len(y) < seq_len:
+            y = y + [arr[-1]] * (seq_len - len(y))
+        x = [sos_id] + y[:-1]
+        ys.append(torch.tensor(y, dtype=torch.long))
+        xs.append(torch.tensor(x, dtype=torch.long))
+
+    xb = torch.stack(xs, 0).to(device)
+    yb = torch.stack(ys, 0).to(device)
+    return xb, yb
 
 @torch.no_grad()
 def _quick_eval_print(model: CharTransformerLM, dev_ids: List[int], sos_id: int, device):
@@ -243,20 +278,37 @@ def train_lm(args, train_text, dev_text, vocab_index):
     np.random.seed(0)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if device.type == 'cuda':
+        try:
+            torch.set_float32_matmul_precision('high')  # allow TF32 matmuls
+        except Exception:
+            pass
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        # Prefer flash/mem-efficient SDPA if available
+        try:
+            torch.backends.cuda.enable_flash_sdp(True)
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+            torch.backends.cuda.enable_math_sdp(False)
+        except Exception:
+            pass
     V = len(vocab_index)
 
     # ---- hyperparameters (safe defaults; override with CLI if desired) ----
-    d_model      = getattr(args, 'd_model', 256)
+    d_model      = getattr(args, 'd_model', 288)
     nhead        = getattr(args, 'nhead', 8)
-    num_layers   = getattr(args, 'num_layers', 3)
-    dim_ff       = getattr(args, 'dim_ff', 512)
+    num_layers   = getattr(args, 'num_layers', 4)
+    dim_ff       = getattr(args, 'dim_ff', 1024)
     dropout      = getattr(args, 'dropout', 0.1)
-    seq_len      = getattr(args, 'seq_len', 256)
-    batch_size   = getattr(args, 'batch_size', 64 if device.type == 'cuda' else 16)
-    lr           = getattr(args, 'lr', 1e-3)
-    weight_decay = getattr(args, 'weight_decay', 0.01)
-    max_epochs   = getattr(args, 'max_epochs', 3)
+    seq_len      = getattr(args, 'seq_len', 320)
+    batch_size   = getattr(args, 'batch_size', 128 if device.type == 'cuda' else 16)
+    lr           = getattr(args, 'lr', 1.5e-3)
+    weight_decay = getattr(args, 'weight_decay', 0.0)
+    max_epochs   = getattr(args, 'max_epochs', 24)
     max_len      = getattr(args, 'max_len', 4096)
+    stride       = getattr(args, 'stride', 8)
+    steps_per_epoch= getattr(args, 'steps_per_epoch', 600 if device.type == 'cuda' else 400)
+    burn_in        = getattr(args, 'burn_in', 64)
 
     # ---- encode text ----
     train_ids = [_oov_to_space_idx(vocab_index, c) for c in train_text]
@@ -275,29 +327,42 @@ def train_lm(args, train_text, dev_text, vocab_index):
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.98), weight_decay=weight_decay)
-    criterion = nn.CrossEntropyLoss()
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.9)
+    criterion = nn.CrossEntropyLoss(ignore_index = -100)
 
-    # ---- make batches ----
-    batches = _stream_to_batches_batchfirst(train_ids, seq_len=seq_len, batch_size=batch_size, sos_id=sos_id, shuffle=True)
-    if len(batches) == 0:
-        # Fallback: shrink seq_len if train is tiny (shouldn't happen in the assignment)
-        seq_len = max(8, min(len(train_ids) - 1, 64))
-        batches = _stream_to_batches_batchfirst(train_ids, seq_len=seq_len, batch_size=batch_size, sos_id=sos_id, shuffle=True)
-
-    # ---- train ----
     for epoch in range(1, max_epochs + 1):
+        # Rebuild/reshuffle overlapping windows each epoch
+        batches = _stream_to_batches_batchfirst(
+            train_ids, seq_len=seq_len, batch_size=batch_size,
+            sos_id=sos_id, shuffle=True, stride=stride
+        )
+        if len(batches) == 0:
+            seq_len = max(8, min(len(train_ids) - 1, 64))
+            batches = _stream_to_batches_batchfirst(
+                train_ids, seq_len=seq_len, batch_size=batch_size,
+                sos_id=sos_id, shuffle=True, stride=stride
+            )
+
         model.train()
         total_loss = 0.0
         for xb, yb in batches:
-            xb = xb.to(device)  # [B, T]
-            yb = yb.to(device)  # [B, T]
+            xb = xb.to(device)
+            yb = yb.to(device)
 
-            optimizer.zero_grad()
-            logits = model(xb)                     # [B, T, V]
-            loss = criterion(logits.view(-1, V), yb.reshape(-1))
+            optimizer.zero_grad(set_to_none=True)
+
+            if burn_in > 0:
+                yb_masked = yb.clone()
+                yb_masked[:, :burn_in] = -100
+            else:
+                yb_masked = yb
+
+            logits = model(xb)  # [B, T, V]
+            loss = criterion(logits.view(-1, V), yb_masked.reshape(-1))
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            scheduler.step()
 
             total_loss += loss.item()
 
@@ -306,3 +371,4 @@ def train_lm(args, train_text, dev_text, vocab_index):
 
     # ---- wrap in assignment API ----
     return NeuralLanguageModel(model=model, vocab_index=vocab_index, device=device, max_seq_len=max_len, sos_char=' ')
+
