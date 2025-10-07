@@ -10,69 +10,40 @@ import torch.nn.functional as F
 
 from transformer import PositionalEncoding
 
+# ---------------- Base API ----------------
 class LanguageModel(object):
-
-    def get_next_char_log_probs(self, context) -> np.ndarray:
-        """
-        Returns a log probability distribution over the next characters given a context.
-        The log should be base e
-
-        NOTE: You should make sure you call model.eval() to determinize inference here (turns off dropout
-        layers in TransformerEncoder).
-        :param context: the string context that the LM conditions on
-        :return: A numpy vector log P(y | context) where y ranges over the output vocabulary.
-        """
+    def get_next_char_log_probs(self, context) -> np.ndarray: 
         raise Exception("Only implemented in subclasses")
-
-
-    def get_log_prob_sequence(self, next_chars, context) -> float:
-        """
-        Scores a bunch of characters following context. That is, returns
-        log P(nc1, nc2, nc3, ... | context) = log P(nc1 | context) + log P(nc2 | context, nc1), ...
-        The log should be base e
-
-        NOTE: You should make sure you call model.eval() to determinize inference here (turns off dropout
-        layers in TransformerEncoder).
-        :param next_chars:
-        :param context:
-        :return: The float probability
-        """
+    
+    def get_log_prob_sequence(self, next_chars, context) -> float: 
         raise Exception("Only implemented in subclasses")
-
 
 class UniformLanguageModel(LanguageModel):
-    def __init__(self, voc_size):
+    def __init__(self, voc_size): 
         self.voc_size = voc_size
-
-    def get_next_char_log_probs(self, context):
+    
+    def get_next_char_log_probs(self, context): 
         return np.ones([self.voc_size]) * np.log(1.0/self.voc_size)
-
-    def get_log_prob_sequence(self, next_chars, context):
+    
+    def get_log_prob_sequence(self, next_chars, context): 
         return np.log(1.0/self.voc_size) * len(next_chars)
 
 def _oov_to_space_idx(vocab_index, ch: str) -> int:
-    """
-    Maps unknowns to the index of space ' ' (SOS per assignment).
-    utils.Indexer.index_of returns -1 if missing.
-    """
     idx = vocab_index.index_of(ch)
-    if idx is None or idx < 0:
+    if idx is None or idx < 0: 
         idx = vocab_index.index_of(' ')
     return idx
 
-
-# =========================
-# Transformer LM (batch-first)
-# =========================
+# ---------------- Transformer LM ----------------
 class CharTransformerLM(nn.Module):
     def __init__(
         self,
         vocab_size: int,
-        d_model: int = 256,
-        nhead: int = 8,
+        d_model: int = 128,
+        nhead: int = 4,
         num_layers: int = 3,
         dim_feedforward: int = 512,
-        dropout: float = 0.1,
+        dropout: float = 0.2,
         max_len: int = 4096,
     ):
         super().__init__()
@@ -80,8 +51,7 @@ class CharTransformerLM(nn.Module):
         self.d_model = d_model
         self.max_len = max_len
 
-        self.embed = nn.Embedding(vocab_size, d_model)
-        # Reuse learned positional embeddings from Part 1 (batched=True path)
+        self.embed = nn.Embedding(vocab_size, d_model, padding_idx=None)
         self.pos = PositionalEncoding(d_model, num_positions=max_len, batched=True)
 
         enc_layer = nn.TransformerEncoderLayer(
@@ -89,46 +59,52 @@ class CharTransformerLM(nn.Module):
             nhead=nhead,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
-            batch_first=True,      # expect [B, T, D]
+            batch_first=True,
             activation='gelu',
-            norm_first = True
+            norm_first=True
         )
         self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
-        self.norm = nn.LayerNorm(d_model)
-        self.proj = nn.Linear(d_model, vocab_size, bias = False)
-        self.proj.weight = self.embed.weight
         self.emb_norm = nn.LayerNorm(d_model)
-        self._mask_cache = {}  # cache by (T, device)
-        
+        self.in_drop = nn.Dropout(p=0.2)
+
+        self.proj = nn.Linear(d_model, vocab_size, bias=False)
+        # Tie weights
+        self.proj.weight = self.embed.weight
+        self.norm = nn.LayerNorm(d_model)
+
+        self._mask_cache = {}
 
     def forward(self, x_ids: torch.Tensor) -> torch.Tensor:
-        """
-        x_ids: [B, T] (Long)
-        returns logits: [B, T, V]
-        """
         B, T = x_ids.shape
-
         x = self.embed(x_ids) * math.sqrt(self.d_model)
-        x = self.emb_norm(x)
         x = self.pos(x)
+        x = self.emb_norm(x)
+        x = self.in_drop(x)
 
-        # cached boolean causal mask (upper triangle = True -> disallowed)
-        # cached float mask: 0 on allowed, -inf on future (upper triangle)
+        # Causal mask - prevent attending to future tokens
         key = (T, x_ids.device)
         if key not in self._mask_cache:
-            m = torch.full((T, T), float('-inf'), device=x_ids.device)
-            m = torch.triu(m, diagonal=1)  # upper triangle -inf; diag/lower 0
-            self._mask_cache[key] = m
+            self._mask_cache[key] = torch.triu(
+                torch.ones((T, T), dtype=torch.bool, device=x_ids.device), 
+                diagonal=1
+            )
         mask = self._mask_cache[key]
 
-
-        x = self.encoder(x, mask=mask)   # no is_causal
+        x = self.encoder(x, mask=mask)
         x = self.norm(x)
-        logits = self.proj(x)                              # [B, T, V]
+        logits = self.proj(x)
         return logits
 
+# ---------------- Neural Language Model API ----------------
 class NeuralLanguageModel(LanguageModel):
-    def __init__(self, model: CharTransformerLM, vocab_index, device: torch.device, max_seq_len: int, sos_char: str = ' '):
+    def __init__(
+        self, 
+        model: CharTransformerLM, 
+        vocab_index, 
+        device: torch.device, 
+        max_seq_len: int, 
+        sos_char: str = ' '
+    ):
         self.model = model.to(device)
         self.vocab_index = vocab_index
         self.device = device
@@ -146,229 +122,237 @@ class NeuralLanguageModel(LanguageModel):
         in_ids = [self.sos_id] + ids
         if len(in_ids) > self.max_seq_len:
             in_ids = in_ids[-self.max_seq_len:]
-
-        x = torch.tensor(in_ids, dtype=torch.long, device=self.device).unsqueeze(0)  # [1, T]
-        logits = self.model(x)                     # [1, T, V]
-        last = logits[0, -1, :]                    # [V]
+        x = torch.tensor(in_ids, dtype=torch.long, device=self.device).unsqueeze(0)
+        logits = self.model(x)
+        last = logits[0, -1, :]
         log_probs = F.log_softmax(last, dim=-1)
         return log_probs.cpu().numpy()
 
     @torch.no_grad()
     def get_log_prob_sequence(self, next_chars, context):
         self.model.eval()
-        # encode once
         ctx_ids = self._encode(context)
         nxt_ids = self._encode(next_chars)
-
         total = 0.0
-        prefix = ctx_ids[:]  # grow this as we consume next_chars
+        prefix = ctx_ids[:]
         for yi in nxt_ids:
-            # build input: [SOS] + prefix  (truncate to keep within max_seq_len)
             in_ids = [self.sos_id] + prefix
             if len(in_ids) > self.max_seq_len:
                 in_ids = in_ids[-self.max_seq_len:]
-
-            x = torch.tensor(in_ids, dtype=torch.long, device=self.device).unsqueeze(0)  # [1, T]
-            logits = self.model(x)                     # [1, T, V]
-            last = logits[0, -1, :]                    # [V]
+            x = torch.tensor(in_ids, dtype=torch.long, device=self.device).unsqueeze(0)
+            logits = self.model(x)
+            last = logits[0, -1, :]
             log_probs = F.log_softmax(last, dim=-1)
             total += float(log_probs[yi].item())
-
-            # teacher-forcing prefix grows with the gold next token
             prefix.append(yi)
-
         return total
 
-def _stream_to_batches_batchfirst(
+# ---------------- Training Utilities ----------------
+def stream_with_left_context(
     ids: List[int],
-    seq_len: int,
+    tgt_len: int,
+    left_ctx: int,
     batch_size: int,
     sos_id: int,
     stride: int,
     shuffle: bool = True
 ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
-    """
-    Slice the long stream into non-overlapping chunks of length seq_len.
-    For each target chunk y[0:T], build input x = [SOS] + y[0:T-1].
-    Returns list of (x_batch, y_batch), each [B, T].
-    """
     X, Y = [], []
     N = len(ids)
-    last_start = N - seq_len
-    if last_start < 0:
-        return []  # not enough data; caller should guard/adjust seq_len
-
+    last_start = N - tgt_len
     for start in range(0, last_start, stride):
-        y_chunk = ids[start:start + seq_len]
-        if len(y_chunk) < seq_len:
-            break
-        x_chunk = [sos_id] + y_chunk[:-1]
-        X.append(torch.tensor(x_chunk, dtype=torch.long))
-        Y.append(torch.tensor(y_chunk, dtype=torch.long))
-
+        y = ids[start:start + tgt_len]
+        ctx_start = max(0, start - left_ctx)
+        x_core = ids[ctx_start:start + tgt_len - 1]
+        need = left_ctx + tgt_len - 1 - len(x_core)
+        if need > 0: 
+            x_core = [sos_id] * need + x_core
+        x = [sos_id] + x_core
+        X.append(torch.tensor(x, dtype=torch.long))
+        Y.append(torch.tensor(y, dtype=torch.long))
+    
     if shuffle:
-        idxs = np.random.permutation(len(X)).tolist()
-        X = [X[i] for i in idxs]
-        Y = [Y[i] for i in idxs]
-
+        perm = np.random.permutation(len(X))
+        X = [X[i] for i in perm]
+        Y = [Y[i] for i in perm]
+    
     batches = []
     for i in range(0, len(X), batch_size):
-        xb = torch.stack(X[i:i + batch_size], dim=0)  # [B, T]
-        yb = torch.stack(Y[i:i + batch_size], dim=0)  # [B, T]
+        xb = torch.stack(X[i:i+batch_size], 0)
+        yb = torch.stack(Y[i:i+batch_size], 0)
         batches.append((xb, yb))
     return batches
 
-def _sample_random_batch(
-    ids: List[int],
-    seq_len: int,
-    batch_size: int,
-    sos_id: int,
-    device
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Randomly sample batch_size windows from the stream.
-    Returns xb, yb with shape [B, T] on device.
-    """
-    N = len(ids)
-    hi = max(1, N - seq_len)
-    starts = np.random.randint(0, hi, size=batch_size)
-
-    xs, ys = [], []
-    arr = ids
-    for s in starts:
-        y = arr[s:s+seq_len]
-        if len(y) < seq_len:
-            y = y + [arr[-1]] * (seq_len - len(y))
-        x = [sos_id] + y[:-1]
-        ys.append(torch.tensor(y, dtype=torch.long))
-        xs.append(torch.tensor(x, dtype=torch.long))
-
-    xb = torch.stack(xs, 0).to(device)
-    yb = torch.stack(ys, 0).to(device)
-    return xb, yb
-
 @torch.no_grad()
-def _quick_eval_print(model: CharTransformerLM, dev_ids: List[int], sos_id: int, device):
-    """
-    Lightweight progress print for visibility (avg logp & perplexity).
-    lm.py does final checks; this is optional but handy during training.
-    """
-    if len(dev_ids) < 2:
+def _quick_eval_print(model, dev_ids, sos_id, device):
+    if len(dev_ids) < 2: 
         return
+    was_training = model.training
+    model.eval()
     x_ids = [sos_id] + dev_ids[:-1]
-    x = torch.tensor(x_ids, dtype=torch.long, device=device).unsqueeze(0)  # [1, T]
-    y = torch.tensor(dev_ids, dtype=torch.long, device=device).unsqueeze(0)  # [1, T]
-    logits = model(x)                                # [1, T, V]
-    log_probs = F.log_softmax(logits, dim=-1)[0]     # [T, V]
-    gold = y[0]                                      # [T]
+    x = torch.tensor(x_ids, dtype=torch.long, device=device).unsqueeze(0)
+    y = torch.tensor(dev_ids, dtype=torch.long, device=device).unsqueeze(0)
+    logits = model(x)
+    log_probs = F.log_softmax(logits, dim=-1)[0]
+    gold = y[0]
     ll = log_probs.gather(-1, gold.unsqueeze(-1)).squeeze(-1).sum().item()
     avg = ll / len(dev_ids)
-    ppl = math.exp(-avg)
-    print(f"   dev_avg_logp={avg:.4f} | dev_ppl={ppl:.3f}")
+    print(f"   dev_avg_logp={avg:.4f} | dev_ppl={math.exp(-avg):.3f}")
+    if was_training: 
+        model.train()
 
+def _make_optimizer(model, lr, weight_decay):
+    # No weight decay for bias and LayerNorm weights
+    decay, no_decay = [], []
+    for n, p in model.named_parameters():
+        if not p.requires_grad: 
+            continue
+        if n.endswith(".bias") or "norm" in n or "emb_norm" in n:
+            no_decay.append(p)
+        else:
+            decay.append(p)
+    return torch.optim.AdamW(
+        [
+            {"params": decay, "weight_decay": weight_decay},
+            {"params": no_decay, "weight_decay": 0.0},
+        ],
+        lr=lr, betas=(0.9, 0.98)
+    )
+
+# ---------------- Training Function ----------------
 def train_lm(args, train_text, dev_text, vocab_index):
-    """
-    :param args: command-line args, passed through here for your convenience
-    :param train_text: train text as a sequence of characters
-    :param dev_text: dev text as a sequence of characters
-    :param vocab_index: an Indexer of the character vocabulary (27 characters)
-    :return: a NeuralLanguageModel instance trained on the given data
-    """
     torch.manual_seed(0)
     np.random.seed(0)
-
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
     if device.type == 'cuda':
-        try:
-            torch.set_float32_matmul_precision('high')  # allow TF32 matmuls
-        except Exception:
+        try: 
+            torch.set_float32_matmul_precision('high')
+        except Exception: 
             pass
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        # Prefer flash/mem-efficient SDPA if available
-        try:
-            torch.backends.cuda.enable_flash_sdp(True)
-            torch.backends.cuda.enable_mem_efficient_sdp(True)
-            torch.backends.cuda.enable_math_sdp(False)
-        except Exception:
-            pass
-    V = len(vocab_index)
 
-    # ---- hyperparameters (safe defaults; override with CLI if desired) ----
-    d_model      = getattr(args, 'd_model', 288)
+    V = len(vocab_index)
+    
+    # Hyperparameters - back to basics, match reference approach
+    d_model      = getattr(args, 'd_model', 256)
     nhead        = getattr(args, 'nhead', 8)
     num_layers   = getattr(args, 'num_layers', 4)
     dim_ff       = getattr(args, 'dim_ff', 1024)
     dropout      = getattr(args, 'dropout', 0.1)
-    seq_len      = getattr(args, 'seq_len', 320)
-    batch_size   = getattr(args, 'batch_size', 128 if device.type == 'cuda' else 16)
-    lr           = getattr(args, 'lr', 1.5e-3)
-    weight_decay = getattr(args, 'weight_decay', 0.0)
-    max_epochs   = getattr(args, 'max_epochs', 24)
+    seq_len      = getattr(args, 'seq_len', 128)
+    batch_size   = getattr(args, 'batch_size', 128 if device.type == 'cuda' else 64)
+    lr           = getattr(args, 'lr', 3e-3)
+    weight_decay = getattr(args, 'weight_decay', 0.01)
+    max_epochs   = getattr(args, 'max_epochs', 30)
     max_len      = getattr(args, 'max_len', 4096)
-    stride       = getattr(args, 'stride', 8)
-    steps_per_epoch= getattr(args, 'steps_per_epoch', 600 if device.type == 'cuda' else 400)
-    burn_in        = getattr(args, 'burn_in', 64)
+    stride       = getattr(args, 'stride', 1)  # Dense overlapping
+    left_ctx     = getattr(args, 'left_ctx', 20)  # Small context window
 
-    # ---- encode text ----
+    # Encode data
     train_ids = [_oov_to_space_idx(vocab_index, c) for c in train_text]
     dev_ids   = [_oov_to_space_idx(vocab_index, c) for c in dev_text]
     sos_id    = _oov_to_space_idx(vocab_index, ' ')
 
-    # ---- build model/optim ----
+    # Model and optimizer
     model = CharTransformerLM(
-        vocab_size=V,
-        d_model=d_model,
-        nhead=nhead,
+        vocab_size=V, 
+        d_model=d_model, 
+        nhead=nhead, 
         num_layers=num_layers,
-        dim_feedforward=dim_ff,
-        dropout=dropout,
+        dim_feedforward=dim_ff, 
+        dropout=dropout, 
         max_len=max_len
     ).to(device)
+    
+    optimizer = _make_optimizer(model, lr, weight_decay)
+    criterion = nn.CrossEntropyLoss()  # No smoothing
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.98), weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.9)
-    criterion = nn.CrossEntropyLoss(ignore_index = -100)
+    # Build batches and scheduler
+    first_batches = stream_with_left_context(
+        train_ids, tgt_len=seq_len, left_ctx=left_ctx,
+        batch_size=batch_size, sos_id=sos_id, stride=stride, shuffle=True
+    )
+    steps_per_epoch = max(1, len(first_batches))
+    total_updates = max(1, steps_per_epoch * max_epochs)
+    warmup = max(200, total_updates // 20)
 
+    def lr_lambda(step):
+        if step < warmup: 
+            return step / float(max(1, warmup))
+        progress = (step - warmup) / float(max(1, total_updates - warmup))
+        return 0.05 + 0.95 * 0.5 * (1 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    best_ppl = float('inf')
+    best_state = None
+    patience = 6
+    bad = 0
+
+    # Training loop
     for epoch in range(1, max_epochs + 1):
-        # Rebuild/reshuffle overlapping windows each epoch
-        batches = _stream_to_batches_batchfirst(
-            train_ids, seq_len=seq_len, batch_size=batch_size,
-            sos_id=sos_id, shuffle=True, stride=stride
+        batches = first_batches if epoch == 1 else stream_with_left_context(
+            train_ids, tgt_len=seq_len, left_ctx=left_ctx,
+            batch_size=batch_size, sos_id=sos_id, stride=stride, shuffle=True
         )
-        if len(batches) == 0:
-            seq_len = max(8, min(len(train_ids) - 1, 64))
-            batches = _stream_to_batches_batchfirst(
-                train_ids, seq_len=seq_len, batch_size=batch_size,
-                sos_id=sos_id, shuffle=True, stride=stride
-            )
-
+        
+        # Training
         model.train()
         total_loss = 0.0
         for xb, yb in batches:
             xb = xb.to(device)
             yb = yb.to(device)
-
             optimizer.zero_grad(set_to_none=True)
-
-            if burn_in > 0:
-                yb_masked = yb.clone()
-                yb_masked[:, :burn_in] = -100
-            else:
-                yb_masked = yb
-
-            logits = model(xb)  # [B, T, V]
-            loss = criterion(logits.view(-1, V), yb_masked.reshape(-1))
+            logits = model(xb)
+            logits_tgt = logits[:, -yb.shape[1]:, :]
+            loss = criterion(logits_tgt.reshape(-1, V), yb.reshape(-1))
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             scheduler.step()
-
             total_loss += loss.item()
 
         print(f"Epoch {epoch:02d} | train_loss={total_loss/len(batches):.4f}")
+        
+        # Quick eval
         _quick_eval_print(model, dev_ids, sos_id, device)
 
-    # ---- wrap in assignment API ----
-    return NeuralLanguageModel(model=model, vocab_index=vocab_index, device=device, max_seq_len=max_len, sos_char=' ')
+        # Full dev evaluation
+        model.eval()
+        with torch.no_grad():
+            x_ids = [sos_id] + dev_ids[:-1]
+            x = torch.tensor(x_ids, dtype=torch.long, device=device).unsqueeze(0)
+            y = torch.tensor(dev_ids, dtype=torch.long, device=device).unsqueeze(0)
+            logits = model(x)
+            lp = F.log_softmax(logits, dim=-1)[0]
+            ll = lp.gather(-1, y[0].unsqueeze(-1)).squeeze(-1).sum().item()
+        
+        avg = ll / len(dev_ids)
+        ppl = math.exp(-avg)
+        print(f"   dev_ppl={ppl:.3f} | lr={optimizer.param_groups[0]['lr']:.6f}")
+        
+        # Save best model
+        if ppl < best_ppl:
+            best_ppl = ppl
+            bad = 0
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            print(f"   *** New best: {best_ppl:.3f}")
+        else:
+            bad += 1
+            if bad > patience: 
+                print(f"Early stopping at epoch {epoch}")
+                break
 
+    # Load best model
+    if best_state is not None:
+        model.load_state_dict({k: v.to(device) for k, v in best_state.items()}, strict=True)
+
+    return NeuralLanguageModel(
+        model=model, 
+        vocab_index=vocab_index, 
+        device=device, 
+        max_seq_len=max_len, 
+        sos_char=' '
+    )
