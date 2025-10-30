@@ -5,6 +5,8 @@ from typing import List
 import numpy as np
 import spacy
 import gc
+import re
+from nltk.corpus import stopwords
 
 
 class FactExample(object):
@@ -82,8 +84,36 @@ class AlwaysEntailedFactChecker(FactChecker):
 
 
 class WordRecallThresholdFactChecker(FactChecker):
+    def __init__(self, threshold: float = 0.65, remove_stopwords: bool = True):
+        self.threshold = threshold
+        self.remove_stopwords = remove_stopwords
+        self.word_re = re.compile(r"\w+")
+        # Initialize stopword list (you may need: nltk.download('stopwords'))
+        self.stopwords = set(stopwords.words('english')) if remove_stopwords else set()
+
+    def _tokens(self, text: str):
+        toks = [t.lower() for t in self.word_re.findall(text)]
+        if self.remove_stopwords:
+            toks = [t for t in toks if t not in self.stopwords]
+        return set(toks)
+
+    def _fact_recall(self, fact_tokens, passage_tokens):
+        if not fact_tokens:
+            return 0.0
+        overlap = len(fact_tokens & passage_tokens)
+        return overlap / len(fact_tokens)
+
     def predict(self, fact: str, passages: List[dict]) -> str:
-        raise Exception("Implement me")
+        fact_tokens = self._tokens(fact)
+        best_recall = 0.0
+        for p in passages:
+            passage_tokens = self._tokens(p["text"])
+            recall = self._fact_recall(fact_tokens, passage_tokens)
+            best_recall = max(best_recall, recall)
+        return "S" if best_recall >= self.threshold else "NS"
+
+
+
 
 
 class EntailmentFactChecker(FactChecker):
