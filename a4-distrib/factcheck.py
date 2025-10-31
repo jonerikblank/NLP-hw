@@ -1,12 +1,14 @@
 # factcheck.py
 
 import torch
+import torch.nn.functional as F
 from typing import List
 import numpy as np
 import spacy
 import gc
 import re
 from nltk.corpus import stopwords
+from heapq import nlargest
 
 
 class FactExample(object):
@@ -27,7 +29,6 @@ class FactExample(object):
     def __repr__(self):
         return repr("fact=" + repr(self.fact) + "; label=" + repr(self.label) + "; passages=" + repr(self.passages))
 
-
 class EntailmentModel(object):
     def __init__(self, model, tokenizer, cuda=False):
         self.model = model
@@ -35,26 +36,53 @@ class EntailmentModel(object):
         self.cuda = cuda
 
     def check_entailment(self, premise: str, hypothesis: str):
+        """Return (p_ent, p_neu, p_contra) for a single pair."""
         with torch.no_grad():
-            # Tokenize the premise and hypothesis
-            inputs = self.tokenizer(premise, hypothesis, return_tensors='pt', truncation=True, padding=True)
+            inputs = self.tokenizer(
+                premise, hypothesis,
+                return_tensors='pt',
+                truncation=True, padding=True,
+                max_length=192  # tighter for speed+memory
+            )
             if self.cuda:
-                inputs = {key: value.to('cuda') for key, value in inputs.items()}
-            # Get the model's prediction
+                inputs = {k: v.to('cuda') for k, v in inputs.items()}
             outputs = self.model(**inputs)
             logits = outputs.logits
-
-        # Note that the labels are ["entailment", "neutral", "contradiction"]. There are a number of ways to map
-        # these logits or probabilities to classification decisions; you'll have to decide how you want to do this.
-
-        raise Exception("Not implemented")
-
-        # To prevent out-of-memory (OOM) issues during autograding, we explicitly delete
-        # objects inputs, outputs, logits, and any results that are no longer needed after the computation.
-        del inputs, outputs, logits
+            probs = F.softmax(logits, dim=-1).squeeze(0)
+            p_ent, p_neu, p_contra = float(probs[0]), float(probs[1]), float(probs[2])
+        del inputs, outputs, logits, probs
+        if self.cuda:
+            torch.cuda.empty_cache()
         gc.collect()
+        return p_ent, p_neu, p_contra
 
-        # return something
+    def check_entailment_batch(self, premises: list, hypothesis: str, batch_size: int = 16):
+        """
+        Batched inference: returns list of (p_ent, p_neu, p_contra) aligned to 'premises'.
+        Much faster than per-sentence calls.
+        """
+        results = []
+        with torch.no_grad():
+            for i in range(0, len(premises), batch_size):
+                chunk = premises[i:i+batch_size]
+                inputs = self.tokenizer(
+                    chunk, [hypothesis]*len(chunk),
+                    return_tensors='pt',
+                    truncation=True, padding=True,
+                    max_length=192
+                )
+                if self.cuda:
+                    inputs = {k: v.to('cuda') for k, v in inputs.items()}
+                outputs = self.model(**inputs)
+                probs = F.softmax(outputs.logits, dim=-1)  # [B,3]
+                probs = probs.detach().cpu()
+                for row in probs:
+                    results.append((float(row[0]), float(row[1]), float(row[2])))
+                del inputs, outputs, probs
+                if self.cuda:
+                    torch.cuda.empty_cache()
+                gc.collect()
+        return results
 
 
 class FactChecker(object):
@@ -112,16 +140,145 @@ class WordRecallThresholdFactChecker(FactChecker):
             best_recall = max(best_recall, recall)
         return "S" if best_recall >= self.threshold else "NS"
 
-
-
-
-
 class EntailmentFactChecker(FactChecker):
-    def __init__(self, ent_model):
+    WORD_RE = re.compile(r"\w+")
+    SENT_SPLIT_RE = re.compile(r"</s>|(?<=[.!?;:])\s+|\n+")
+
+    def __init__(
+        self,
+        ent_model,
+        entail_threshold: float = 0.45,       # keeps S recall healthy
+        entail_high_threshold: float = 0.70,  # confident shortcut
+        margin_threshold: float = 0.06,       # ↑ a touch to shave FPs
+        prune_overlap_threshold: float = 0.05,# light gate for speed
+        max_sentences_per_passage: int = 60,  # safety cap
+        top_m_per_passage: int = 8,           # local cap
+        top_k_candidates: int = 28,           # global cap (keeps runtime ~½–⅓)
+        hybrid_overlap_fallback: float = 0.74 # lexical backstop
+    ):
         self.ent_model = ent_model
+        self.entail_threshold = entail_threshold
+        self.entail_high_threshold = entail_high_threshold
+        self.margin_threshold = margin_threshold
+        self.prune_overlap_threshold = prune_overlap_threshold
+        self.max_sentences_per_passage = max_sentences_per_passage
+        self.top_m_per_passage = top_m_per_passage
+        self.top_k_candidates = top_k_candidates
+        self.hybrid_overlap_fallback = hybrid_overlap_fallback
+
+    def _tokens(self, s: str):
+        return set(t.lower() for t in self.WORD_RE.findall(s))
+
+    def _fact_recall(self, fact_tokens, text_tokens) -> float:
+        if not fact_tokens:
+            return 0.0
+        return len(fact_tokens & text_tokens) / len(fact_tokens)
+
+    def _sentences(self, passage_text: str):
+        txt = passage_text.replace("<s>", " ").strip()
+        parts = [s.strip() for s in self.SENT_SPLIT_RE.split(txt) if s.strip()]
+        if len(parts) > self.max_sentences_per_passage:
+            parts = parts[:self.max_sentences_per_passage]
+        return parts
 
     def predict(self, fact: str, passages: List[dict]) -> str:
-        raise Exception("Implement me")
+        fact_toks = self._tokens(fact)
+
+        # Early global prune: if no sentence in any passage reaches tiny overlap, call NS (very fast path)
+        global_best_overlap = 0.0
+
+        # 1) Per-passage candidate selection (keep top-m by recall)
+        per_passage_candidates = []
+        for p in passages:
+            title = p.get("title", "").strip()
+            sents = self._sentences(p["text"])
+            if not sents:
+                continue
+
+            scored = []
+            for s in sents:
+                rec = self._fact_recall(fact_toks, self._tokens(s))
+                if rec >= self.prune_overlap_threshold:
+                    scored.append((rec, s, title))
+                global_best_overlap = max(global_best_overlap, rec)
+
+            if not scored:
+                # keep best one anyway
+                best = max(
+                    ((self._fact_recall(fact_toks, self._tokens(s)), s, title) for s in sents),
+                    key=lambda x: x[0],
+                    default=None
+                )
+                if best:
+                    scored = [best]
+                    global_best_overlap = max(global_best_overlap, scored[0][0])
+
+            if scored:
+                # local top-m
+                per_passage_candidates.extend(nlargest(self.top_m_per_passage, scored, key=lambda x: x[0]))
+
+        if not per_passage_candidates:
+            return "NS"
+
+        # Global top-k
+        topk = nlargest(self.top_k_candidates, per_passage_candidates, key=lambda x: x[0])
+
+        # If even the best lexical overlap is extremely high, remember it for the fallback
+        best_overlap = topk[0][0] if topk else global_best_overlap
+
+        # 2) Build single-premise strings with title context (no double scoring)
+        premises = []
+        for _, sent, title in topk:
+            prem = f"{title}. {sent}" if title else sent
+            premises.append(prem)
+
+        # 3) One batched entailment call
+        probs = self.ent_model.check_entailment_batch(premises, fact, batch_size=16)
+
+        # 4) Aggregate: best p_ent and best margin
+        best_p_ent = 0.0
+        best_margin = -1.0
+        best_p_contra = 0.0
+        for (p_ent, _p_neu, p_contra) in probs:
+            if p_ent > best_p_ent:
+                best_p_ent = p_ent
+            margin = p_ent - p_contra
+            if margin > best_margin:
+                best_margin = margin
+            if p_contra > best_p_contra:
+                best_p_contra = p_contra
+
+        # ---- Decision rule (precision-leaning) ----
+        # thresholds: slightly stricter to shave FPs
+        ENTAIL_HIGH = 0.70       # was 0.70
+        ENTAIL_MAIN = 0.42       # was 0.46
+        MARGIN = 0.03           # was 0.06
+        HYBRID_OVERLAP = 0.68    # was 0.72
+        CONTRA_VETO = 0.55       # new: if contradiction is strong, force NS
+        # Dynamic entail threshold: lower it when lexical overlap is strong
+        # Scale: if best_overlap ∈ [0.0, 0.9+], reduce threshold by up to 0.06
+        effective_entail = ENTAIL_MAIN - 0.06 * min(1.0, best_overlap / 0.90)
+
+
+        # Contradiction veto for borderline cases
+        if best_p_contra >= CONTRA_VETO and best_margin < 0.04:
+            return "NS"
+
+        if best_p_ent >= ENTAIL_HIGH:
+            return "S"
+        if (best_p_ent >= effective_entail) and (best_margin >= MARGIN):
+            return "S"
+        if (best_p_ent >= effective_entail - 0.05) and (best_overlap >= HYBRID_OVERLAP):
+            return "S"
+        if (best_p_ent >= 0.50) and (best_p_contra <= 0.20) and (best_margin >= 0.02):
+            return "S"
+        if (best_p_ent >= 0.52) and (best_p_contra <= 0.18):
+            return "S"
+
+
+        return "NS"
+
+
 
 
 # OPTIONAL
