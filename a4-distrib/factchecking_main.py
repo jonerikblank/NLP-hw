@@ -86,7 +86,36 @@ def predict_two_classes(examples: List[FactExample], fact_checker):
 
         confusion_mat[gold_label][pred_label] += 1
         ex_count += 1
+
+        false_positives = []  
+        false_negatives = []
+
+        # NEW: Capture errors
+        if gold_label == 0 and pred_label == 1:  # Gold=S, Pred=NS
+            false_negatives.append({
+                'fact': example.fact,
+                'passages': example.passages,
+                'gold': 'S',
+                'pred': 'NS'
+            })
+        elif gold_label == 1 and pred_label == 0:  # Gold=NS, Pred=S
+            false_positives.append({
+                'fact': example.fact,
+                'passages': example.passages,
+                'gold': 'NS',
+                'pred': 'S'
+            })
     print_eval_stats(confusion_mat, gold_label_indexer)
+
+    with open('false_positives.json', 'w') as f:
+        json.dump(false_positives, f, indent=2)
+    with open('false_negatives.json', 'w') as f:
+        json.dump(false_negatives, f, indent=2)
+    
+    print(f"\n--- Error Analysis ---")
+    print(f"False Positives (predicted S, gold NS): {len(false_positives)}")
+    print(f"False Negatives (predicted NS, gold S): {len(false_negatives)}")
+    print(f"Saved errors to false_positives.json and false_negatives.json")
 
 
 def print_eval_stats(confusion_mat, gold_label_indexer):

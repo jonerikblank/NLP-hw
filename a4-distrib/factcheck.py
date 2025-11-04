@@ -150,10 +150,10 @@ class EntailmentFactChecker(FactChecker):
         entail_threshold: float = 0.45,       # keeps S recall healthy
         entail_high_threshold: float = 0.70,  # confident shortcut
         margin_threshold: float = 0.06,       # ↑ a touch to shave FPs
-        prune_overlap_threshold: float = 0.05,# light gate for speed
+        prune_overlap_threshold: float = 0.01,# light gate for speed
         max_sentences_per_passage: int = 60,  # safety cap
-        top_m_per_passage: int = 8,           # local cap
-        top_k_candidates: int = 28,           # global cap (keeps runtime ~½–⅓)
+        top_m_per_passage: int = 10,           # local cap
+        top_k_candidates: int = 40,           # global cap (keeps runtime ~½–⅓)
         hybrid_overlap_fallback: float = 0.74 # lexical backstop
     ):
         self.ent_model = ent_model
@@ -233,52 +233,25 @@ class EntailmentFactChecker(FactChecker):
             premises.append(prem)
 
         # 3) One batched entailment call
-        probs = self.ent_model.check_entailment_batch(premises, fact, batch_size=16)
-
-        # 4) Aggregate: best p_ent and best margin
-        best_p_ent = 0.0
-        best_margin = -1.0
-        best_p_contra = 0.0
-        for (p_ent, _p_neu, p_contra) in probs:
-            if p_ent > best_p_ent:
-                best_p_ent = p_ent
-            margin = p_ent - p_contra
-            if margin > best_margin:
-                best_margin = margin
-            if p_contra > best_p_contra:
-                best_p_contra = p_contra
-
-        # ---- Decision rule (precision-leaning) ----
-        # thresholds: slightly stricter to shave FPs
-        ENTAIL_HIGH = 0.70       # was 0.70
-        ENTAIL_MAIN = 0.42       # was 0.46
-        MARGIN = 0.03           # was 0.06
-        HYBRID_OVERLAP = 0.68    # was 0.72
-        CONTRA_VETO = 0.55       # new: if contradiction is strong, force NS
-        # Dynamic entail threshold: lower it when lexical overlap is strong
-        # Scale: if best_overlap ∈ [0.0, 0.9+], reduce threshold by up to 0.06
-        effective_entail = ENTAIL_MAIN - 0.06 * min(1.0, best_overlap / 0.90)
-
-
-        # Contradiction veto for borderline cases
-        if best_p_contra >= CONTRA_VETO and best_margin < 0.04:
+        probs = self.ent_model.check_entailment_batch(premises, fact, batch_size=8)
+    
+        if not probs:
             return "NS"
+        
+        # Get all scores
+        entail_scores = [p[0] for p in probs]
+        contra_scores = [p[2] for p in probs]
+        margins = [p[0] - p[2] for p in probs]
 
-        if best_p_ent >= ENTAIL_HIGH:
-            return "S"
-        if (best_p_ent >= effective_entail) and (best_margin >= MARGIN):
-            return "S"
-        if (best_p_ent >= effective_entail - 0.05) and (best_overlap >= HYBRID_OVERLAP):
-            return "S"
-        if (best_p_ent >= 0.50) and (best_p_contra <= 0.20) and (best_margin >= 0.02):
-            return "S"
-        if (best_p_ent >= 0.52) and (best_p_contra <= 0.18):
-            return "S"
+        best_ent = max(entail_scores)
+        best_margin = max(margins)
 
-
+        # Simple decision with small margin boost
+        if best_ent >= 0.42:
+            return "S"
+        if best_ent >= 0.38 and best_margin >= 0.10:
+            return "S"
         return "NS"
-
-
 
 
 # OPTIONAL
