@@ -42,7 +42,7 @@ class EntailmentModel(object):
                 premise, hypothesis,
                 return_tensors='pt',
                 truncation=True, padding=True,
-                max_length=192  # tighter for speed+memory
+                max_length=128  # tighter for speed+memory
             )
             if self.cuda:
                 inputs = {k: v.to('cuda') for k, v in inputs.items()}
@@ -56,35 +56,39 @@ class EntailmentModel(object):
         gc.collect()
         return p_ent, p_neu, p_contra
 
-    def check_entailment_batch(self, premises: list, hypothesis: str, batch_size: int = 16):
+    def check_entailment_batch(self, premises: list, hypothesis: str, batch_size: int = 1):  # ALWAYS 1
         """
-        Batched inference: returns list of (p_ent, p_neu, p_contra) aligned to 'premises'.
-        Much faster than per-sentence calls.
+        Process one premise at a time to avoid OOM.
         """
         results = []
         with torch.no_grad():
-            for i in range(0, len(premises), batch_size):
-                chunk = premises[i:i+batch_size]
+            for premise in premises:
+                # Truncate premise if too long
+                if len(premise) > 200:
+                    premise = premise[:200]
+                
                 inputs = self.tokenizer(
-                    chunk, [hypothesis]*len(chunk),
+                    [premise], [hypothesis],
                     return_tensors='pt',
-                    truncation=True, padding=True,
-                    max_length=192
+                    truncation=True, 
+                    padding=True,
+                    max_length=100  # Very aggressive truncation
                 )
                 if self.cuda:
                     inputs = {k: v.to('cuda') for k, v in inputs.items()}
+                
                 outputs = self.model(**inputs)
-                probs = F.softmax(outputs.logits, dim=-1)  # [B,3]
+                probs = F.softmax(outputs.logits, dim=-1)
                 probs = probs.detach().cpu()
-                for row in probs:
-                    results.append((float(row[0]), float(row[1]), float(row[2])))
+                row = probs[0]
+                results.append((float(row[0]), float(row[1]), float(row[2])))
+                
                 del inputs, outputs, probs
                 if self.cuda:
                     torch.cuda.empty_cache()
                 gc.collect()
+        
         return results
-
-
 class FactChecker(object):
     """
     Fact checker base type
@@ -150,10 +154,10 @@ class EntailmentFactChecker(FactChecker):
         entail_threshold: float = 0.45,       # keeps S recall healthy
         entail_high_threshold: float = 0.70,  # confident shortcut
         margin_threshold: float = 0.06,       # ↑ a touch to shave FPs
-        prune_overlap_threshold: float = 0.01,# light gate for speed
-        max_sentences_per_passage: int = 60,  # safety cap
-        top_m_per_passage: int = 10,           # local cap
-        top_k_candidates: int = 40,           # global cap (keeps runtime ~½–⅓)
+        prune_overlap_threshold: float = 0.1,# light gate for speed
+        max_sentences_per_passage: int = 30,  # safety cap
+        top_m_per_passage: int = 7,           # local cap
+        top_k_candidates: int = 22,           # global cap (keeps runtime ~½–⅓)
         hybrid_overlap_fallback: float = 0.74 # lexical backstop
     ):
         self.ent_model = ent_model
@@ -179,6 +183,7 @@ class EntailmentFactChecker(FactChecker):
         parts = [s.strip() for s in self.SENT_SPLIT_RE.split(txt) if s.strip()]
         if len(parts) > self.max_sentences_per_passage:
             parts = parts[:self.max_sentences_per_passage]
+        parts = [s[:150] if len(s) > 150 else s for s in parts]  # NEW LINE
         return parts
 
     def predict(self, fact: str, passages: List[dict]) -> str:
@@ -233,7 +238,7 @@ class EntailmentFactChecker(FactChecker):
             premises.append(prem)
 
         # 3) One batched entailment call
-        probs = self.ent_model.check_entailment_batch(premises, fact, batch_size=8)
+        probs = self.ent_model.check_entailment_batch(premises, fact, batch_size=4)
     
         if not probs:
             return "NS"
@@ -246,10 +251,10 @@ class EntailmentFactChecker(FactChecker):
         best_ent = max(entail_scores)
         best_margin = max(margins)
 
-        # Simple decision with small margin boost
-        if best_ent >= 0.42:
+        # Slightly more lenient
+        if best_ent >= 0.40:  # Changed from 0.42
             return "S"
-        if best_ent >= 0.38 and best_margin >= 0.10:
+        if best_ent >= 0.36 and best_margin >= 0.10:  # Changed from 0.38
             return "S"
         return "NS"
 
