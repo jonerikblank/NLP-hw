@@ -184,10 +184,10 @@ class EntailmentFactChecker(FactChecker):
         entail_threshold: float = 0.45,       # keeps S recall healthy
         entail_high_threshold: float = 0.70,  # confident shortcut
         margin_threshold: float = 0.06,       # ↑ a touch to shave FPs
-        prune_overlap_threshold: float = 0.1,# light gate for speed
-        max_sentences_per_passage: int = 30,  # safety cap
+        prune_overlap_threshold: float = 0.08,# light gate for speed
+        max_sentences_per_passage: int = 35,  # safety cap
         top_m_per_passage: int = 7,           # local cap
-        top_k_candidates: int = 22,           # global cap (keeps runtime ~½–⅓)
+        top_k_candidates: int = 24,           # global cap (keeps runtime ~½–⅓)
         hybrid_overlap_fallback: float = 0.74 # lexical backstop
     ):
         self.ent_model = ent_model
@@ -272,23 +272,11 @@ class EntailmentFactChecker(FactChecker):
 
         best_ent = max(entail_scores)
         best_margin = max(margins)
-        min_contra = min(contra_scores)
-        avg_entail = np.mean(entail_scores)
 
-        # Very aggressive for recall - we need 1-2 more correct
-        if best_ent >= 0.55:  # Lowered again
+        # Simple, effective decision
+        if best_ent >= 0.40:
             return "S"
-
-        if best_ent >= 0.35 and best_margin >= 0.08:  # Very low threshold
-            return "S"
-
-        if best_ent >= 0.40 and min_contra <= 0.35:  # More lenient
-            return "S"
-
-        if best_ent >= 0.45 and avg_entail >= 0.30:  # General agreement
-            return "S"
-
-        if best_ent >= 0.33 and best_margin >= 0.18:  # Very low threshold, very strong margin
+        if best_ent >= 0.35 and best_margin >= 0.10:
             return "S"
 
         return "NS"
