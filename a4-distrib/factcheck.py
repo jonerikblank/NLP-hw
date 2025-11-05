@@ -56,37 +56,67 @@ class EntailmentModel(object):
         gc.collect()
         return p_ent, p_neu, p_contra
 
-    def check_entailment_batch(self, premises: list, hypothesis: str, batch_size: int = 1):  # ALWAYS 1
+    def check_entailment_batch(self, premises: list, hypothesis: str, batch_size: int = 2):
         """
-        Process one premise at a time to avoid OOM.
+        Process with small batches, fallback to single if needed.
         """
         results = []
         with torch.no_grad():
-            for premise in premises:
-                # Truncate premise if too long
-                if len(premise) > 200:
-                    premise = premise[:200]
+            i = 0
+            while i < len(premises):
+                # Try batch of 2
+                chunk = premises[i:i+batch_size]
                 
-                inputs = self.tokenizer(
-                    [premise], [hypothesis],
-                    return_tensors='pt',
-                    truncation=True, 
-                    padding=True,
-                    max_length=100  # Very aggressive truncation
-                )
-                if self.cuda:
-                    inputs = {k: v.to('cuda') for k, v in inputs.items()}
+                # Truncate long premises
+                chunk = [p[:150] if len(p) > 150 else p for p in chunk]
                 
-                outputs = self.model(**inputs)
-                probs = F.softmax(outputs.logits, dim=-1)
-                probs = probs.detach().cpu()
-                row = probs[0]
-                results.append((float(row[0]), float(row[1]), float(row[2])))
-                
-                del inputs, outputs, probs
-                if self.cuda:
-                    torch.cuda.empty_cache()
-                gc.collect()
+                try:
+                    inputs = self.tokenizer(
+                        chunk, [hypothesis]*len(chunk),
+                        return_tensors='pt',
+                        truncation=True, 
+                        padding=True,
+                        max_length=100
+                    )
+                    if self.cuda:
+                        inputs = {k: v.to('cuda') for k, v in inputs.items()}
+                    
+                    outputs = self.model(**inputs)
+                    probs = F.softmax(outputs.logits, dim=-1)
+                    probs = probs.detach().cpu()
+                    for row in probs:
+                        results.append((float(row[0]), float(row[1]), float(row[2])))
+                    
+                    del inputs, outputs, probs
+                    if self.cuda:
+                        torch.cuda.empty_cache()
+                    gc.collect()
+                    
+                    i += batch_size
+                    
+                except RuntimeError as e:
+                    # If OOM, process one at a time
+                    if "allocate" in str(e).lower():
+                        for single_p in chunk:
+                            inputs = self.tokenizer(
+                                [single_p[:150]], [hypothesis],
+                                return_tensors='pt',
+                                truncation=True,
+                                padding=True,
+                                max_length=100
+                            )
+                            if self.cuda:
+                                inputs = {k: v.to('cuda') for k, v in inputs.items()}
+                            outputs = self.model(**inputs)
+                            probs = F.softmax(outputs.logits, dim=-1).detach().cpu()
+                            results.append((float(probs[0][0]), float(probs[0][1]), float(probs[0][2])))
+                            del inputs, outputs, probs
+                            if self.cuda:
+                                torch.cuda.empty_cache()
+                            gc.collect()
+                        i += batch_size
+                    else:
+                        raise e
         
         return results
 class FactChecker(object):
@@ -189,9 +219,6 @@ class EntailmentFactChecker(FactChecker):
     def predict(self, fact: str, passages: List[dict]) -> str:
         fact_toks = self._tokens(fact)
 
-        # Early global prune: if no sentence in any passage reaches tiny overlap, call NS (very fast path)
-        global_best_overlap = 0.0
-
         # 1) Per-passage candidate selection (keep top-m by recall)
         per_passage_candidates = []
         for p in passages:
@@ -205,7 +232,6 @@ class EntailmentFactChecker(FactChecker):
                 rec = self._fact_recall(fact_toks, self._tokens(s))
                 if rec >= self.prune_overlap_threshold:
                     scored.append((rec, s, title))
-                global_best_overlap = max(global_best_overlap, rec)
 
             if not scored:
                 # keep best one anyway
@@ -216,7 +242,6 @@ class EntailmentFactChecker(FactChecker):
                 )
                 if best:
                     scored = [best]
-                    global_best_overlap = max(global_best_overlap, scored[0][0])
 
             if scored:
                 # local top-m
@@ -228,34 +253,44 @@ class EntailmentFactChecker(FactChecker):
         # Global top-k
         topk = nlargest(self.top_k_candidates, per_passage_candidates, key=lambda x: x[0])
 
-        # If even the best lexical overlap is extremely high, remember it for the fallback
-        best_overlap = topk[0][0] if topk else global_best_overlap
-
-        # 2) Build single-premise strings with title context (no double scoring)
+        # 2) Build premises with title context
         premises = []
         for _, sent, title in topk:
             prem = f"{title}. {sent}" if title else sent
             premises.append(prem)
 
-        # 3) One batched entailment call
-        probs = self.ent_model.check_entailment_batch(premises, fact, batch_size=4)
-    
+        # 3) Batched entailment call
+        probs = self.ent_model.check_entailment_batch(premises, fact, batch_size=2)
+        
         if not probs:
             return "NS"
         
-        # Get all scores
+        # 4) Get all scores and decide
         entail_scores = [p[0] for p in probs]
         contra_scores = [p[2] for p in probs]
         margins = [p[0] - p[2] for p in probs]
 
         best_ent = max(entail_scores)
         best_margin = max(margins)
+        min_contra = min(contra_scores)
+        avg_top3 = np.mean(sorted(entail_scores, reverse=True)[:min(3, len(entail_scores))])
 
-        # Slightly more lenient
-        if best_ent >= 0.40:  # Changed from 0.42
+        # More aggressive for recall
+        if best_ent >= 0.60:  # Lowered from 0.65
             return "S"
-        if best_ent >= 0.36 and best_margin >= 0.10:  # Changed from 0.38
+
+        if best_ent >= 0.38 and best_margin >= 0.08:  # Lowered from 0.40
             return "S"
+
+        if best_ent >= 0.42 and min_contra <= 0.30:  # More lenient
+            return "S"
+
+        if avg_top3 >= 0.45:  # NEW: Multiple sentences support
+            return "S"
+
+        if best_ent >= 0.36 and best_margin >= 0.15:  # Lower threshold, very strong margin
+            return "S"
+
         return "NS"
 
 
@@ -289,3 +324,4 @@ class DependencyRecallThresholdFactChecker(FactChecker):
             relation = (head, token.dep_, dependent)
             relations.add(relation)
         return relations
+
