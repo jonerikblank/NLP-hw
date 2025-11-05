@@ -264,7 +264,7 @@ class EntailmentFactChecker(FactChecker):
         
         if not probs:
             return "NS"
-        
+       
         # 4) Get all scores and decide
         entail_scores = [p[0] for p in probs]
         contra_scores = [p[2] for p in probs]
@@ -273,22 +273,22 @@ class EntailmentFactChecker(FactChecker):
         best_ent = max(entail_scores)
         best_margin = max(margins)
         min_contra = min(contra_scores)
-        avg_top3 = np.mean(sorted(entail_scores, reverse=True)[:min(3, len(entail_scores))])
+        avg_entail = np.mean(entail_scores)
 
-        # More aggressive for recall
-        if best_ent >= 0.60:  # Lowered from 0.65
+        # Very aggressive for recall - we need 1-2 more correct
+        if best_ent >= 0.55:  # Lowered again
             return "S"
 
-        if best_ent >= 0.38 and best_margin >= 0.08:  # Lowered from 0.40
+        if best_ent >= 0.35 and best_margin >= 0.08:  # Very low threshold
             return "S"
 
-        if best_ent >= 0.42 and min_contra <= 0.30:  # More lenient
+        if best_ent >= 0.40 and min_contra <= 0.35:  # More lenient
             return "S"
 
-        if avg_top3 >= 0.45:  # NEW: Multiple sentences support
+        if best_ent >= 0.45 and avg_entail >= 0.30:  # General agreement
             return "S"
 
-        if best_ent >= 0.36 and best_margin >= 0.15:  # Lower threshold, very strong margin
+        if best_ent >= 0.33 and best_margin >= 0.18:  # Very low threshold, very strong margin
             return "S"
 
         return "NS"
