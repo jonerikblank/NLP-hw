@@ -184,10 +184,10 @@ class EntailmentFactChecker(FactChecker):
         entail_threshold: float = 0.45,       # keeps S recall healthy
         entail_high_threshold: float = 0.70,  # confident shortcut
         margin_threshold: float = 0.06,       # ↑ a touch to shave FPs
-        prune_overlap_threshold: float = 0.08,# light gate for speed
-        max_sentences_per_passage: int = 35,  # safety cap
-        top_m_per_passage: int = 7,           # local cap
-        top_k_candidates: int = 24,           # global cap (keeps runtime ~½–⅓)
+        prune_overlap_threshold: float = 0.1,# light gate for speed
+        max_sentences_per_passage: int = 30,  # safety cap
+        top_m_per_passage: int = 5,           # local cap
+        top_k_candidates: int = 22,           # global cap (keeps runtime ~½–⅓)
         hybrid_overlap_fallback: float = 0.74 # lexical backstop
     ):
         self.ent_model = ent_model
@@ -272,11 +272,14 @@ class EntailmentFactChecker(FactChecker):
 
         best_ent = max(entail_scores)
         best_margin = max(margins)
+        min_contra = min(contra_scores)
 
-        # Simple, effective decision
-        if best_ent >= 0.40:
+        # Balanced decision logic
+        if best_ent >= 0.42:
             return "S"
-        if best_ent >= 0.35 and best_margin >= 0.10:
+        if best_ent >= 0.38 and best_margin >= 0.10:
+            return "S"
+        if best_ent >= 0.40 and min_contra <= 0.25:
             return "S"
 
         return "NS"
