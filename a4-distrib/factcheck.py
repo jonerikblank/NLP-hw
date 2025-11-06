@@ -184,10 +184,10 @@ class EntailmentFactChecker(FactChecker):
         entail_threshold: float = 0.45,       # keeps S recall healthy
         entail_high_threshold: float = 0.70,  # confident shortcut
         margin_threshold: float = 0.06,       # ↑ a touch to shave FPs
-        prune_overlap_threshold: float = 0.1,# light gate for speed
-        max_sentences_per_passage: int = 30,  # safety cap
-        top_m_per_passage: int = 5,           # local cap
-        top_k_candidates: int = 22,           # global cap (keeps runtime ~½–⅓)
+        prune_overlap_threshold: float = 0.05,# light gate for speed
+        max_sentences_per_passage: int = 40,  # safety cap
+        top_m_per_passage: int = 7,           # local cap
+        top_k_candidates: int = 28,           # global cap (keeps runtime ~½–⅓)
         hybrid_overlap_fallback: float = 0.74 # lexical backstop
     ):
         self.ent_model = ent_model
@@ -259,12 +259,11 @@ class EntailmentFactChecker(FactChecker):
             prem = f"{title}. {sent}" if title else sent
             premises.append(prem)
 
-        # 3) Batched entailment call
         probs = self.ent_model.check_entailment_batch(premises, fact, batch_size=2)
-        
+    
         if not probs:
             return "NS"
-       
+        
         # 4) Get all scores and decide
         entail_scores = [p[0] for p in probs]
         contra_scores = [p[2] for p in probs]
@@ -274,7 +273,6 @@ class EntailmentFactChecker(FactChecker):
         best_margin = max(margins)
         min_contra = min(contra_scores)
 
-        # Balanced decision logic
         if best_ent >= 0.42:
             return "S"
         if best_ent >= 0.38 and best_margin >= 0.10:
